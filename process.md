@@ -1,45 +1,74 @@
-# Linux 6.19 커널 프로세스의 삶 — 생성, 전환, 소멸
+# The Life of a Linux 6.19 Kernel Process — Creation, Switching, and Destruction
 
-> 소스 기준: `/home/inineapa/Lab/linux-6.19`
+> Source base: `/home/inineapa/Lab/linux-6.19`
 
 ---
 
-## 1. 핵심 자료구조와 관계
+## 1. Core Data Structures and Their Relationships
 
-### 1.1 전체 구조 다이어그램
+Every process in the Linux kernel is represented by a `task_struct`, defined at `include/linux/sched.h:819`. This single structure is the kernel's view of a process — it holds the process state, scheduling parameters, PID, kernel stack pointer, and pointers to every resource the process owns. Rather than embedding all data directly, `task_struct` points outward to separate structures that each manage a specific domain of the process's resources.
+
+The `__state` field records the current scheduling state of the task: `TASK_RUNNING`, `TASK_INTERRUPTIBLE`, `TASK_UNINTERRUPTIBLE`, and so on. The `pid` and `tgid` fields identify the task at the individual thread level and the thread group level, respectively. The `void *stack` field points to the base of the kernel stack, which is allocated per-task and is used whenever the CPU is executing kernel code on behalf of this process.
+
+The `thread` field, of type `thread_struct`, stores the architecture-specific CPU register state that must be saved and restored during context switches. On x86_64, this includes the stack pointer (`sp`), FS/GS base addresses, I/O permission bitmaps, and floating-point state.
+
+Scheduling is governed by a trio of embedded entities: `sched_entity` (for CFS), `sched_rt_entity` (for real-time), and `sched_dl_entity` (for deadline scheduling). The `sched_class` pointer determines which scheduling class currently governs this task.
+
+The exit-related fields — `exit_state`, `exit_code`, and `exit_signal` — track whether the process is alive, a zombie awaiting reaping, or fully dead. The family relationship fields (`real_parent`, `parent`, `children`, `sibling`, `group_leader`) form the process tree that determines signal delivery and wait semantics.
+
+Each `task_struct` points to the following shared or per-process structures:
+
+- **`mm_struct *mm`**: The user-space address space. Contains the page table root (`pgd`), the VMA tree (via maple tree), and memory accounting data. Kernel threads set this to NULL.
+- **`mm_struct *active_mm`**: The address space currently loaded into the CPU's page table registers. For user processes this equals `mm`. For kernel threads, this is "borrowed" from the previous user process via lazy TLB switching.
+- **`fs_struct *fs`**: The filesystem context — current working directory, root directory, and umask.
+- **`files_struct *files`**: The file descriptor table, mapping integer file descriptors to `struct file *` pointers via the `fdtable`.
+- **`signal_struct *signal`**: Thread-group-wide signal state, shared among all threads in a process.
+- **`sighand_struct *sighand`**: The signal handler table, mapping signal numbers to their registered handlers.
+- **`nsproxy *nsproxy`**: Namespace proxy, pointing to the PID, network, mount, UTS, and IPC namespaces this task belongs to.
+- **`cred *cred`**: Credentials — UID, GID, and capabilities.
+
+The `sched_entity` embedded in `task_struct` contains a `rb_node run_node` used to position the task within the CFS red-black tree, and a `u64 vruntime` that records the task's virtual runtime — the key by which CFS orders tasks for fairness.
+
+### 1.1 task_struct Overall Structure
 
 ```mermaid
 graph TB
     subgraph "task_struct (include/linux/sched.h:819)"
         TS_STATE["__state: unsigned int<br/>TASK_RUNNING | INTERRUPTIBLE | ..."]
         TS_PID["pid / tgid"]
-        TS_STACK["void *stack (커널 스택)"]
-        TS_THREAD["thread: thread_struct<br/>(arch별 CPU 레지스터)"]
+        TS_STACK["void *stack (kernel stack)"]
+        TS_THREAD["thread: thread_struct<br/>(arch-specific CPU registers)"]
         TS_SCHED["sched_class *<br/>se: sched_entity<br/>rt: sched_rt_entity<br/>dl: sched_dl_entity"]
         TS_EXIT["exit_state / exit_code / exit_signal"]
         TS_REL["real_parent / parent<br/>children / sibling / group_leader"]
     end
 
-    TS_STATE --- MM["mm_struct *mm<br/>(유저 주소 공간)"]
-    TS_STATE --- AMM["mm_struct *active_mm<br/>(커널 스레드가 빌려쓰는 mm)"]
+    TS_STATE --- MM["mm_struct *mm<br/>(user address space)"]
+    TS_STATE --- AMM["mm_struct *active_mm<br/>(mm borrowed by kernel threads)"]
     TS_STATE --- FS["fs_struct *fs<br/>(cwd, root, umask)"]
-    TS_STATE --- FILES["files_struct *files<br/>(열린 파일 디스크립터 테이블)"]
-    TS_STATE --- SIG["signal_struct *signal<br/>(스레드 그룹 공유 시그널 상태)"]
-    TS_STATE --- SIGHAND["sighand_struct *sighand<br/>(시그널 핸들러 테이블)"]
+    TS_STATE --- FILES["files_struct *files<br/>(open file descriptor table)"]
+    TS_STATE --- SIG["signal_struct *signal<br/>(thread group shared signal state)"]
+    TS_STATE --- SIGHAND["sighand_struct *sighand<br/>(signal handler table)"]
     TS_STATE --- NSPROXY["nsproxy *nsproxy<br/>(pid/net/mnt/uts/ipc ns)"]
     TS_STATE --- CRED["cred *cred<br/>(uid, gid, capabilities)"]
 
-    MM --> VMA["vm_area_struct<br/>(VMA 리스트 / maple tree)"]
-    MM --> PGD["pgd_t *pgd<br/>(페이지 테이블 루트)"]
+    MM --> VMA["vm_area_struct<br/>(VMA list / maple tree)"]
+    MM --> PGD["pgd_t *pgd<br/>(page table root)"]
 
     TS_SCHED --> SE["sched_entity"]
-    SE --> RB["rb_node run_node<br/>(CFS RB-tree 내 위치)"]
-    SE --> VRT["u64 vruntime<br/>(가상 실행 시간)"]
+    SE --> RB["rb_node run_node<br/>(position in CFS RB-tree)"]
+    SE --> VRT["u64 vruntime<br/>(virtual runtime)"]
 
-    FILES --> FDT["fdtable<br/>(fd → file * 매핑)"]
+    FILES --> FDT["fdtable<br/>(fd -> file * mapping)"]
 ```
 
-### 1.2 스케줄러 관련 자료구조
+### 1.2 Scheduler-Related Data Structures
+
+The scheduler operates on a per-CPU `struct rq` (runqueue), defined at `kernel/sched/sched.h:1119`. Each runqueue holds a spinlock, a count of runnable tasks (`nr_running`), pointers to the currently executing task (`curr`) and the idle task (`idle`), and embedded sub-runqueues for each scheduling class: `cfs_rq`, `rt_rq`, and `dl_rq`.
+
+The CFS runqueue maintains a red-black tree sorted by `vruntime`. The task with the smallest `vruntime` is always the leftmost node in the tree and is the next candidate for execution. Each `sched_entity` within the tree carries a `load_weight` (derived from the task's nice value), the `run_node` for tree positioning, `vruntime`, `slice` (the time slice allocated), and `sum_exec_runtime` (total CPU time consumed).
+
+The kernel defines five scheduling classes, checked in strict priority order from highest to lowest: `stop_sched_class` (used for CPU hotplug and migration), `dl_sched_class` (SCHED_DEADLINE), `rt_sched_class` (SCHED_FIFO / SCHED_RR), `fair_sched_class` (CFS, the default), and `idle_sched_class` (the idle task). The scheduler iterates through these classes in order; the first class that has a runnable task wins.
 
 ```mermaid
 graph LR
@@ -56,7 +85,7 @@ graph LR
 
     subgraph "CFS runqueue"
         CFS_RQ["struct cfs_rq"]
-        CFS_RB["RB-tree<br/>(vruntime 순 정렬)"]
+        CFS_RB["RB-tree<br/>(sorted by vruntime)"]
         CFS_NR["h_nr_queued"]
     end
 
@@ -72,282 +101,328 @@ graph LR
     CFS_RQ --> CFS_RB
     CFS_RB --> SE2_RB
 
-    subgraph "스케줄링 클래스 우선순위"
+    subgraph "Scheduling class priority"
         SC_STOP["stop_sched_class"]
         SC_DL["dl_sched_class"]
         SC_RT["rt_sched_class"]
         SC_FAIR["fair_sched_class"]
         SC_IDLE["idle_sched_class"]
     end
-    SC_STOP -->|"높음 →"| SC_DL --> SC_RT --> SC_FAIR --> SC_IDLE
+    SC_STOP -->|"high ->"| SC_DL --> SC_RT --> SC_FAIR --> SC_IDLE
 ```
 
-### 1.3 task_struct 상태 전이
+### 1.3 task_struct State Transitions
+
+A task begins its life in the `TASK_NEW` state, set by `copy_process()` during creation. When `wake_up_new_task()` is called, it transitions to `TASK_RUNNING` and becomes eligible for scheduling. From `TASK_RUNNING`, a task may enter `TASK_INTERRUPTIBLE` (sleeping but can be woken by signals) or `TASK_UNINTERRUPTIBLE` (sleeping, only woken by the specific event it awaits — commonly I/O completion). It can also be stopped via `SIGSTOP` or traced via `ptrace`.
+
+When the task terminates, `do_task_dead()` sets it to `TASK_DEAD`, and `exit_notify()` marks it as `EXIT_ZOMBIE`. The zombie remains until the parent calls `wait()`, at which point `release_task()` transitions it to `EXIT_DEAD` and `free_task()` reclaims the memory.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> TASK_NEW: copy_process()에서 생성
+    [*] --> TASK_NEW: created in copy_process()
     TASK_NEW --> TASK_RUNNING: wake_up_new_task()
 
-    TASK_RUNNING --> TASK_INTERRUPTIBLE: schedule() 호출<br/>(시그널로 깨울 수 있음)
-    TASK_RUNNING --> TASK_UNINTERRUPTIBLE: schedule() 호출<br/>(I/O 대기 등)
+    TASK_RUNNING --> TASK_INTERRUPTIBLE: schedule() called<br/>(can be woken by signals)
+    TASK_RUNNING --> TASK_UNINTERRUPTIBLE: schedule() called<br/>(e.g. waiting for I/O)
     TASK_RUNNING --> __TASK_STOPPED: SIGSTOP / ptrace
     TASK_RUNNING --> __TASK_TRACED: ptrace attach
 
-    TASK_INTERRUPTIBLE --> TASK_RUNNING: wake_up() / 시그널
+    TASK_INTERRUPTIBLE --> TASK_RUNNING: wake_up() / signal
     TASK_UNINTERRUPTIBLE --> TASK_RUNNING: wake_up()
     __TASK_STOPPED --> TASK_RUNNING: SIGCONT
     __TASK_TRACED --> TASK_RUNNING: ptrace detach
 
     TASK_RUNNING --> TASK_DEAD: do_task_dead()
     TASK_DEAD --> EXIT_ZOMBIE: exit_notify()
-    EXIT_ZOMBIE --> EXIT_DEAD: release_task()<br/>(부모가 wait() 호출 후)
+    EXIT_ZOMBIE --> EXIT_DEAD: release_task()<br/>(after parent calls wait())
     EXIT_DEAD --> [*]: free_task()
 ```
 
 ---
 
-## 2. 프로세스 생성
+## 2. Process Creation
 
-### 2.1 유저 공간 프로세스 생성 (fork / clone)
+### 2.1 User-Space Process Creation (fork / clone)
+
+When a user-space process calls `fork()`, `clone()`, or `clone3()`, the syscall entry layer routes the request to `kernel_clone()` (`fork.c:2610`). This function first validates the clone flags, then calls `copy_process()` (`fork.c:1966`) to perform the deep copy of the parent's `task_struct`.
+
+Inside `copy_process()`, the first step is `dup_task_struct(current)` (`fork.c:1052`), which allocates a new `task_struct` and kernel stack, then copies the parent's entire `task_struct` into the new one. Following this, the function copies or shares each resource category depending on the `CLONE_*` flags provided. For example, `copy_mm()` either duplicates the entire memory address space with copy-on-write (COW) page table entries, or — if `CLONE_VM` is set — simply shares the parent's `mm_struct` (this is how threads work).
+
+The remaining copy functions follow the same pattern: `copy_files()` for file descriptors, `copy_fs()` for the filesystem context, `copy_sighand()` for signal handlers, `copy_signal()` for signal state, `copy_namespaces()` for namespaces, and `copy_io()` for the I/O context. Each one either increments a reference count on the parent's structure (sharing) or allocates a new copy.
+
+After resource copying, the scheduler is initialized via `sched_fork()`. This sets the child's state to `TASK_NEW`, computes its priority, determines its scheduling class, and initializes its `vruntime`.
+
+Then `copy_thread()` (`arch/x86/kernel/process.c:170`) sets up the architecture-specific register frame. On x86_64, it copies the parent's `pt_regs` into the child's kernel stack, sets `childregs->ax = 0` (so that fork returns 0 in the child), stores the child's stack pointer, copies the I/O permission bitmap, and configures `ret_from_fork_asm` as the entry point for when the child is first scheduled.
+
+Finally, `alloc_pid()` assigns a PID, and control returns to `kernel_clone()`, which calls `wake_up_new_task()` to insert the child into the scheduler's runqueue. This sets the child's state to `TASK_RUNNING`, calls `enqueue_task()` to place it in the CFS red-black tree, and invokes `check_preempt_curr()` to determine whether the new child should preempt the currently running task.
+
+The parent receives the child's PID as the return value of `fork()`. The child, when eventually picked by the scheduler, begins execution at `ret_from_fork_asm`, calls `finish_task_switch()` to complete the context switch bookkeeping, then returns to user space with a return value of 0.
+
+#### Key Code Points
+
+| Stage | Function | Location | Core Action |
+|-------|----------|----------|-------------|
+| Entry | `kernel_clone()` | `fork.c:2610` | Validate clone_flags, call copy_process |
+| Copy | `dup_task_struct()` | `fork.c:1052` | Allocate and copy task_struct + kernel stack |
+| Scheduler init | `sched_fork()` | `core.c` | state=TASK_NEW, initialize vruntime |
+| Arch setup | `copy_thread()` | `arch/x86/process.c:170` | Set up register frame, ax=0 |
+| Enqueue | `wake_up_new_task()` | `core.c` | Transition to TASK_RUNNING, enqueue |
+| Child first run | `ret_from_fork_asm` | `entry_64.S` | schedule_tail() -> return to user space |
+
+**Sharing vs. copying based on `CLONE_*` flags:**
+
+| Flag | When set | When unset |
+|------|----------|------------|
+| `CLONE_VM` | Share mm (thread) | Copy mm (COW) |
+| `CLONE_FILES` | Share files_struct | Copy |
+| `CLONE_FS` | Share fs_struct | Copy |
+| `CLONE_SIGHAND` | Share sighand | Copy |
+| `CLONE_THREAD` | Same thread group | New thread group |
 
 ```mermaid
 sequenceDiagram
-    participant U as 유저 프로세스
+    participant U as User process
     participant SYS as syscall entry
     participant KC as kernel_clone()<br/>fork.c:2610
     participant CP as copy_process()<br/>fork.c:1966
     participant CT as copy_thread()<br/>arch/x86/process.c:170
-    participant SCHED as 스케줄러
-    participant CHILD as 자식 프로세스
+    participant SCHED as Scheduler
+    participant CHILD as Child process
 
     U->>SYS: fork() / clone() / clone3()
     SYS->>KC: kernel_clone(args)
 
-    Note over KC: clone_flags 유효성 검증
+    Note over KC: Validate clone_flags
 
     KC->>CP: copy_process(NULL, trace, NUMA_NO_NODE, args)
 
-    Note over CP: dup_task_struct(current)<br/>→ task_struct + 커널 스택 복사
+    Note over CP: dup_task_struct(current)<br/>-> allocate + copy task_struct and kernel stack
 
     rect rgb(255, 235, 205)
-        Note over CP: === 리소스 복사 (clone_flags에 따라 공유 or 복사) ===
-        CP->>CP: copy_files() — 파일 디스크립터 테이블
-        CP->>CP: copy_fs() — 파일시스템 컨텍스트 (cwd, root)
-        CP->>CP: copy_sighand() — 시그널 핸들러
-        CP->>CP: copy_signal() — 시그널 상태
-        CP->>CP: copy_mm() — 메모리 주소 공간 (COW 페이지 테이블)
-        CP->>CP: copy_namespaces() — 네임스페이스
-        CP->>CP: copy_io() — I/O 컨텍스트
+        Note over CP: === Resource copy (share or copy per clone_flags) ===
+        CP->>CP: copy_files() -- file descriptor table
+        CP->>CP: copy_fs() -- filesystem context (cwd, root)
+        CP->>CP: copy_sighand() -- signal handlers
+        CP->>CP: copy_signal() -- signal state
+        CP->>CP: copy_mm() -- memory address space (COW page tables)
+        CP->>CP: copy_namespaces() -- namespaces
+        CP->>CP: copy_io() -- I/O context
     end
 
     rect rgb(220, 240, 255)
-        Note over CP,SCHED: === 스케줄러 초기화 ===
+        Note over CP,SCHED: === Scheduler initialization ===
         CP->>SCHED: sched_fork(clone_flags, p)
-        Note over SCHED: p->__state = TASK_NEW<br/>p->prio 계산<br/>p->sched_class 결정<br/>p->se.vruntime 초기화
+        Note over SCHED: p->__state = TASK_NEW<br/>compute p->prio<br/>determine p->sched_class<br/>initialize p->se.vruntime
     end
 
     CP->>CT: copy_thread(p, args)
-    Note over CT: childregs = task_pt_regs(p)<br/>*childregs = *current_pt_regs()<br/>childregs->ax = 0 (자식 반환값)<br/>p->thread.sp = childregs<br/>p->thread.io_bitmap 복사<br/>ret_from_fork_asm 설정
+    Note over CT: childregs = task_pt_regs(p)<br/>*childregs = *current_pt_regs()<br/>childregs->ax = 0 (child return value)<br/>p->thread.sp = childregs<br/>copy p->thread.io_bitmap<br/>set ret_from_fork_asm as entry point
 
-    CP->>CP: alloc_pid() — PID 할당
-    CP-->>KC: return p (새 task_struct)
+    CP->>CP: alloc_pid() -- allocate PID
+    CP-->>KC: return p (new task_struct)
 
     rect rgb(220, 255, 220)
-        Note over KC,SCHED: === 스케줄러가 새 태스크를 런큐에 삽입 ===
+        Note over KC,SCHED: === Scheduler inserts new task into runqueue ===
         KC->>SCHED: wake_up_new_task(p)
-        Note over SCHED: p->__state = TASK_RUNNING<br/>activate_task(rq, p)<br/>→ enqueue_task(rq, p)<br/>→ CFS: rbtree에 삽입<br/>check_preempt_curr()로<br/>현재 태스크 선점 여부 확인
+        Note over SCHED: p->__state = TASK_RUNNING<br/>activate_task(rq, p)<br/>-> enqueue_task(rq, p)<br/>-> CFS: insert into rbtree<br/>check_preempt_curr()<br/>to test preemption of current task
     end
 
     KC-->>SYS: return child pid
-    SYS-->>U: fork() 반환 (부모: child pid)
+    SYS-->>U: fork() returns (parent: child pid)
 
-    Note over CHILD: 스케줄러에 의해 pick되면 실행 시작
-    SCHED->>CHILD: context_switch → ret_from_fork_asm
-    Note over CHILD: schedule_tail(prev) 호출<br/>→ finish_task_switch(prev)<br/>→ syscall_exit_to_user_mode()<br/>→ 유저공간 복귀 (fork 반환값 = 0)
+    Note over CHILD: Begins execution when picked by scheduler
+    SCHED->>CHILD: context_switch -> ret_from_fork_asm
+    Note over CHILD: schedule_tail(prev) called<br/>-> finish_task_switch(prev)<br/>-> syscall_exit_to_user_mode()<br/>-> return to user space (fork return value = 0)
 ```
 
-#### 핵심 코드 포인트
+### 2.2 Kernel Thread Creation
 
-| 단계 | 함수 | 위치 | 핵심 동작 |
-|------|------|------|-----------|
-| 진입 | `kernel_clone()` | `fork.c:2610` | clone_flags 검증, copy_process 호출 |
-| 복사 | `dup_task_struct()` | `fork.c:1052` | task_struct 메모리 할당 + 복사 |
-| 스케줄러 초기화 | `sched_fork()` | `core.c` | 상태=TASK_NEW, vruntime 초기화 |
-| arch 설정 | `copy_thread()` | `arch/x86/process.c:170` | 레지스터 프레임 설정, ax=0 |
-| 런큐 삽입 | `wake_up_new_task()` | `core.c` | TASK_RUNNING 전환, enqueue |
-| 자식 첫 실행 | `ret_from_fork_asm` | `entry_64.S` | schedule_tail() → 유저 복귀 |
+Kernel threads are created through a different mechanism than user processes. The typical entry point is `kthread_create_on_node()` (`kthread.c:578`), which does not directly call `fork()`. Instead, it queues a `kthread_create_info` structure onto the global `kthread_create_list` and wakes up `kthreadd`, the kernel thread daemon (PID 2, `kthread.c:815`).
 
-**`CLONE_*` 플래그에 따른 공유 vs 복사:**
+The `kthreadd` daemon runs an infinite loop. When it wakes, it dequeues a creation request and calls `create_kthread()` (`kthread.c:478`), which in turn calls `kernel_thread()` (`fork.c:2700`). This function sets up `kernel_clone_args` with the `kthread` flag set to 1, and forces `CLONE_VM | CLONE_UNTRACED` in addition to the caller-specified flags (typically `CLONE_FS | CLONE_FILES | SIGCHLD`).
 
-| 플래그 | 설정 시 | 미설정 시 |
-|--------|---------|-----------|
-| `CLONE_VM` | mm 공유 (스레드) | mm 복사 (COW) |
-| `CLONE_FILES` | files_struct 공유 | 복사 |
-| `CLONE_FS` | fs_struct 공유 | 복사 |
-| `CLONE_SIGHAND` | sighand 공유 | 복사 |
-| `CLONE_THREAD` | 같은 스레드 그룹 | 새 스레드 그룹 |
+Inside `copy_thread()`, the behavior differs from user process creation: all child registers (`childregs`) are zeroed out, and `kthread_frame_init()` sets up the kernel thread's function and argument pointers. The entry point is still `ret_from_fork_asm`, but the execution path diverges — the new thread enters the `kthread()` function (`kthread.c:411`) rather than returning to user space.
 
-### 2.2 커널 스레드 생성
+Once the kernel thread is scheduled for the first time, it calls `complete(done)` to notify the creator that it exists, then parks itself with `schedule_preempt_disabled()`. The creator receives the `task_struct *` pointer back and can either call `wake_up_process()` directly or use the convenience wrapper `kthread_run()` to immediately start the thread's designated function `threadfn(data)`.
+
+When the kernel thread finishes its work, it calls `kthread_exit()`.
+
+**Kernel thread vs. user process differences:**
+
+| Property | Kernel thread | User process |
+|----------|---------------|--------------|
+| `mm` | NULL (no user address space) | Own mm_struct |
+| `active_mm` | Borrowed from previous task (lazy TLB) | == mm |
+| `PF_KTHREAD` flag | Set | Not set |
+| Page tables | Kernel page tables only | User + kernel |
+| `copy_thread()` behavior | childregs=0, kthread_frame_init | Copy parent regs, ax=0 |
 
 ```mermaid
 sequenceDiagram
-    participant CALLER as 커널 코드
+    participant CALLER as Kernel code
     participant KCR as kthread_create()<br/>kthread.c:578
-    participant LIST as kthread_create_list<br/>(전역 링크드 리스트)
+    participant LIST as kthread_create_list<br/>(global linked list)
     participant KTD as kthreadd (PID 2)<br/>kthread.c:815
     participant CK as create_kthread()<br/>kthread.c:478
     participant KT as kernel_thread()<br/>fork.c:2700
-    participant SCHED as 스케줄러
-    participant NEW as 새 커널 스레드
+    participant SCHED as Scheduler
+    participant NEW as New kernel thread
 
     CALLER->>KCR: kthread_create_on_node(threadfn, data, node, name)
-    KCR->>LIST: kthread_create_info를 리스트에 추가
+    KCR->>LIST: Add kthread_create_info to list
     KCR->>KTD: wake_up_process(kthreadd_task)
     KCR->>KCR: wait_for_completion_killable(&done)
 
-    Note over KTD: kthreadd 무한 루프에서 깨어남
+    Note over KTD: kthreadd wakes from infinite loop
 
     KTD->>CK: create_kthread(create_info)
     CK->>KT: kernel_thread(kthread, create, name,<br/>CLONE_FS | CLONE_FILES | SIGCHLD)
 
     Note over KT: kernel_clone_args.kthread = 1<br/>flags |= CLONE_VM | CLONE_UNTRACED
 
-    KT->>KT: kernel_clone(args)<br/>→ copy_process()
-    Note over KT: copy_thread()에서:<br/>childregs 전부 0으로 초기화<br/>kthread_frame_init(frame, fn, arg)<br/>→ ret_from_fork_asm 진입점 설정
+    KT->>KT: kernel_clone(args)<br/>-> copy_process()
+    Note over KT: In copy_thread():<br/>zero all childregs<br/>kthread_frame_init(frame, fn, arg)<br/>-> set ret_from_fork_asm as entry point
 
     rect rgb(220, 255, 220)
-        Note over KT,SCHED: 스케줄러 삽입
+        Note over KT,SCHED: Scheduler insertion
         KT->>SCHED: wake_up_new_task(p)
     end
 
-    Note over NEW: kthread() 함수가 진입점 (kthread.c:411)
+    Note over NEW: kthread() is the entry point (kthread.c:411)
 
-    SCHED->>NEW: 스케줄에 의해 실행 시작
-    NEW->>NEW: complete(done) — 생성 요청자 깨움
-    NEW->>NEW: schedule_preempt_disabled() — park 상태로 대기
-    KCR-->>CALLER: return task_struct * (새 커널 스레드)
+    SCHED->>NEW: Begins execution when scheduled
+    NEW->>NEW: complete(done) -- wakes the creator
+    NEW->>NEW: schedule_preempt_disabled() -- park and wait
+    KCR-->>CALLER: return task_struct * (new kernel thread)
 
-    Note over CALLER: kthread_run() 또는 wake_up_process()로<br/>실제 실행 시작
+    Note over CALLER: Use kthread_run() or wake_up_process()<br/>to start actual execution
 
     CALLER->>NEW: wake_up_process()
-    NEW->>NEW: threadfn(data) — 사용자 지정 함수 실행
+    NEW->>NEW: threadfn(data) -- execute user-specified function
     NEW->>NEW: kthread_exit(ret)
 ```
 
-**커널 스레드 vs 유저 프로세스 차이:**
-
-| 속성 | 커널 스레드 | 유저 프로세스 |
-|------|-------------|---------------|
-| `mm` | NULL (유저 주소 공간 없음) | 고유 mm_struct |
-| `active_mm` | 이전 태스크에서 빌려씀 (lazy TLB) | == mm |
-| `PF_KTHREAD` 플래그 | 설정됨 | 미설정 |
-| 페이지 테이블 | 커널 페이지 테이블만 사용 | 유저+커널 |
-| `copy_thread()` 동작 | childregs=0, kthread_frame_init | 부모 regs 복사, ax=0 |
-
 ---
 
-## 3. 컨텍스트 스위치 (Context Switch)
+## 3. Context Switch
 
-### 3.1 전체 흐름
+### 3.1 Overall Flow
+
+A context switch is the mechanism by which the CPU stops executing one task and begins executing another. This can happen voluntarily (the task calls `schedule()` or `cond_resched()`), or involuntarily (the scheduler forces preemption via `preempt_schedule_irq()` at interrupt return, or via `exit_to_user_mode()` at syscall return).
+
+Regardless of the trigger, the core function is `__schedule()` (`core.c:6722`). It begins by disabling local interrupts and acquiring the runqueue lock. It then reads the previous task's state. If the previous task is no longer `TASK_RUNNING` (for example, it has set its state to `TASK_INTERRUPTIBLE` before calling `schedule()`), the function calls `try_to_block_task()` to dequeue it from the runqueue.
+
+Next, `pick_next_task()` iterates through the scheduling classes in priority order and selects the next task to run. For the common case where only CFS tasks are present, `pick_next_task_fair()` selects the `sched_entity` with the smallest `vruntime` from the red-black tree.
+
+If the selected task is different from the currently running task, a context switch is necessary. `context_switch()` (`core.c:5201`) performs this in three stages:
+
+**Stage 1 — Preparation:** `prepare_task_switch()` fires perf events for the scheduling-out task and marks the incoming task as on-CPU.
+
+**Stage 2 — Memory space switch:** If the next task is a kernel thread (`next->mm == NULL`), the kernel simply enters lazy TLB mode — the next task borrows the previous task's `active_mm`, avoiding a costly TLB flush. If the next task is a user process, `switch_mm_irqs_off()` loads the new task's page directory (`pgd`) into the CR3 register, switching the page tables and (unless PCID is used) flushing the TLB.
+
+**Stage 3 — CPU register switch:** `switch_to()` calls `__switch_to_asm()` (`entry_64.S:178`), which is the point where the CPU physically transitions from one task to another. This assembly routine pushes the callee-saved registers (`rbp`, `rbx`, `r12`-`r15`) onto the current (old) task's kernel stack, saves the old stack pointer to `prev->thread.sp`, loads the new task's stack pointer from `next->thread.sp` into `%rsp`, pops the new task's callee-saved registers, and fills the return speculation buffer (Spectre RSB mitigation). It then jumps to `__switch_to()` (`process_64.c:610`), which handles the remaining CPU state: FPU/SIMD state, FS/GS segment bases, TLS descriptors, segment registers, memory protection keys (PKRU), and the per-CPU `current_task` pointer.
+
+From this point forward, the CPU is executing on the new task's kernel stack. The new task calls `finish_task_switch(prev)` (`core.c:5075`) to complete the transition: it fires perf scheduling-in events, clears `prev->on_cpu`, releases the runqueue lock, and — critically — if `prev` was in `TASK_DEAD` state, it calls `put_task_stack()` and `put_task_struct_rcu_user()` to begin the final cleanup of the dead task's resources (see Section 4).
 
 ```mermaid
 sequenceDiagram
-    participant PREV as 현재 태스크 (prev)
+    participant PREV as Current task (prev)
     participant SCHED as __schedule()<br/>core.c:6722
     participant PICK as pick_next_task()
-    participant CFS as CFS 스케줄러<br/>fair.c
+    participant CFS as CFS scheduler<br/>fair.c
     participant CTX as context_switch()<br/>core.c:5201
     participant ASM as __switch_to_asm()<br/>entry_64.S:178
-    participant HW as CPU 하드웨어
-    participant NEXT as 다음 태스크 (next)
+    participant HW as CPU hardware
+    participant NEXT as Next task (next)
     participant FIN as finish_task_switch()<br/>core.c:5075
 
-    Note over PREV: schedule() 호출 지점들:<br/>1) 자발적: schedule(), cond_resched()<br/>2) 선점: preempt_schedule_irq()<br/>3) syscall 리턴: exit_to_user_mode()
+    Note over PREV: Points where schedule() is called:<br/>1) Voluntary: schedule(), cond_resched()<br/>2) Preemption: preempt_schedule_irq()<br/>3) Syscall return: exit_to_user_mode()
 
     PREV->>SCHED: __schedule(sched_mode)
     Note over SCHED: local_irq_disable()<br/>rq_lock(rq, &rf)<br/>update_rq_clock(rq)
 
     SCHED->>SCHED: prev_state = READ_ONCE(prev->__state)
-    Note over SCHED: prev가 TASK_RUNNING이 아니면<br/>try_to_block_task()로 런큐에서 제거
+    Note over SCHED: If prev is not TASK_RUNNING,<br/>try_to_block_task() dequeues it
 
     rect rgb(220, 240, 255)
-        Note over SCHED,CFS: === 스케줄러: 다음 태스크 선택 ===
+        Note over SCHED,CFS: === Scheduler: select next task ===
         SCHED->>PICK: pick_next_task(rq, prev, rf)
         PICK->>CFS: pick_next_task_fair(rq, prev, rf)
-        Note over CFS: RB-tree에서 가장 작은<br/>vruntime을 가진 sched_entity 선택
+        Note over CFS: Select sched_entity with<br/>smallest vruntime from RB-tree
         CFS-->>PICK: next task_struct
         PICK-->>SCHED: next
     end
 
     Note over SCHED: clear_tsk_need_resched(prev)
 
-    alt prev != next (태스크 전환 필요)
+    alt prev != next (task switch required)
         SCHED->>CTX: context_switch(rq, prev, next, rf)
 
-        Note over CTX: === 1단계: 전환 준비 ===
+        Note over CTX: === Stage 1: Switch preparation ===
         CTX->>CTX: prepare_task_switch(rq, prev, next)
         Note over CTX: perf_event_task_sched_out()<br/>WRITE_ONCE(next->on_cpu, 1)
 
-        Note over CTX: === 2단계: 메모리 공간 전환 ===
-        alt next->mm == NULL (커널 스레드)
+        Note over CTX: === Stage 2: Memory space switch ===
+        alt next->mm == NULL (kernel thread)
             CTX->>CTX: enter_lazy_tlb(prev->active_mm, next)
-            Note over CTX: next->active_mm = prev->active_mm<br/>(TLB flush 없이 빌려씀)
-        else next->mm != NULL (유저 프로세스)
+            Note over CTX: next->active_mm = prev->active_mm<br/>(borrow without TLB flush)
+        else next->mm != NULL (user process)
             CTX->>HW: switch_mm_irqs_off(prev->active_mm, next->mm, next)
-            Note over HW: CR3 레지스터에 next->mm->pgd 로드<br/>→ 페이지 테이블 전환<br/>→ TLB flush (PCID 지원시 최소화)
+            Note over HW: Load next->mm->pgd into CR3<br/>-> page table switch<br/>-> TLB flush (minimized with PCID)
         end
 
-        Note over CTX: === 3단계: CPU 레지스터 전환 ===
+        Note over CTX: === Stage 3: CPU register switch ===
         CTX->>ASM: switch_to(prev, next, prev)
 
         rect rgb(255, 220, 220)
-            Note over ASM,HW: === 하드웨어 레벨 레지스터 전환 ===
-            ASM->>HW: pushq %rbp, %rbx, %r12-r15 (prev 스택에 저장)
-            ASM->>HW: movq %rsp → prev->thread.sp (prev 스택 포인터 저장)
-            Note over HW: ★ 여기서 스택이 바뀜 ★
-            ASM->>HW: movq next->thread.sp → %rsp (next 스택 포인터 로드)
-            ASM->>HW: popq %r15-r12, %rbx, %rbp (next 스택에서 복원)
-            ASM->>HW: FILL_RETURN_BUFFER (Spectre RSB 완화)
+            Note over ASM,HW: === Hardware-level register switch ===
+            ASM->>HW: pushq %rbp, %rbx, %r12-r15 (save to prev's stack)
+            ASM->>HW: movq %rsp -> prev->thread.sp (save prev stack pointer)
+            Note over HW: *** Stack switches here ***
+            ASM->>HW: movq next->thread.sp -> %rsp (load next stack pointer)
+            ASM->>HW: popq %r15-r12, %rbx, %rbp (restore from next's stack)
+            ASM->>HW: FILL_RETURN_BUFFER (Spectre RSB mitigation)
         end
 
         ASM->>ASM: jmp __switch_to (process_64.c:610)
-        Note over ASM: switch_fpu(prev) — FPU/SIMD 상태 저장/복원<br/>save_fsgs(prev) / x86_fsgsbase_load()<br/>load_TLS(next) — TLS 디스크립터<br/>DS/ES 세그먼트 레지스터 전환<br/>x86_pkru_load() — 메모리 보호 키<br/>raw_cpu_write(current_task, next)
+        Note over ASM: switch_fpu(prev) -- save/restore FPU/SIMD state<br/>save_fsgs(prev) / x86_fsgsbase_load()<br/>load_TLS(next) -- TLS descriptors<br/>DS/ES segment register switch<br/>x86_pkru_load() -- memory protection keys<br/>raw_cpu_write(current_task, next)
 
-        Note over NEXT: ← 이 시점부터 next 태스크의 스택에서 실행
+        Note over NEXT: <- From this point, executing on next task's stack
 
         NEXT->>FIN: finish_task_switch(prev)
-        Note over FIN: vtime_task_switch(prev)<br/>perf_event_task_sched_in()<br/>smp_store_release(&prev->on_cpu, 0)<br/>finish_lock_switch(rq) — rq 락 해제<br/>prev가 TASK_DEAD이면 put_task_struct()
+        Note over FIN: vtime_task_switch(prev)<br/>perf_event_task_sched_in()<br/>smp_store_release(&prev->on_cpu, 0)<br/>finish_lock_switch(rq) -- release rq lock<br/>if prev is TASK_DEAD: put_task_struct()
     end
 ```
 
-### 3.2 스케줄러 개입 지점 종합
+### 3.2 Summary of Scheduler Intervention Points
+
+The scheduler intervenes at specific, well-defined points throughout a process's lifetime. During process creation, `sched_fork()` initializes the scheduling parameters and `wake_up_new_task()` enqueues the new task. During normal execution, voluntary scheduling occurs when a task calls `schedule()`, `cond_resched()`, or blocks on a mutex or wait queue. Involuntary preemption is triggered by the timer interrupt (`scheduler_tick()` sets `TIF_NEED_RESCHED`), checked at interrupt return (`preempt_schedule_irq()`), at syscall return (`exit_to_user_mode_loop()`), and when a higher-priority task is woken up (`try_to_wake_up()` calls `check_preempt_curr()`). At process death, `do_task_dead()` performs the final involuntary scheduling call, after which `finish_task_switch()` handles the dead task's cleanup.
 
 ```mermaid
 graph TB
-    subgraph "스케줄러가 개입하는 지점들"
+    subgraph "Points where the scheduler intervenes"
         direction TB
 
-        subgraph "프로세스 생성 시"
-            C1["sched_fork()<br/>→ __state=TASK_NEW, prio 계산, vruntime 초기화"]
-            C2["wake_up_new_task()<br/>→ activate_task() → enqueue_task()<br/>→ check_preempt_curr() 선점 검사"]
+        subgraph "Process creation"
+            C1["sched_fork()<br/>-> __state=TASK_NEW, compute prio, init vruntime"]
+            C2["wake_up_new_task()<br/>-> activate_task() -> enqueue_task()<br/>-> check_preempt_curr() preemption check"]
         end
 
-        subgraph "자발적 양보"
-            V1["schedule()<br/>→ sched_submit_work() → __schedule()"]
-            V2["cond_resched()<br/>→ TIF_NEED_RESCHED 체크 후 schedule()"]
-            V3["mutex_lock() / wait_event() 등<br/>→ set_current_state(INTERRUPTIBLE)<br/>→ schedule()"]
+        subgraph "Voluntary yielding"
+            V1["schedule()<br/>-> sched_submit_work() -> __schedule()"]
+            V2["cond_resched()<br/>-> check TIF_NEED_RESCHED then schedule()"]
+            V3["mutex_lock() / wait_event() etc.<br/>-> set_current_state(INTERRUPTIBLE)<br/>-> schedule()"]
         end
 
-        subgraph "비자발적 선점 (Preemption)"
-            P1["타이머 인터럽트 (tick)<br/>→ scheduler_tick()<br/>→ curr->sched_class->task_tick()<br/>→ resched_curr() (TIF_NEED_RESCHED 설정)"]
-            P2["인터럽트 리턴 시<br/>→ preempt_schedule_irq()"]
-            P3["syscall 리턴 시<br/>→ exit_to_user_mode_loop()<br/>→ TIF_NEED_RESCHED 체크 → schedule()"]
-            P4["wake_up_process() 시<br/>→ try_to_wake_up()<br/>→ ttwu_do_activate() → enqueue<br/>→ check_preempt_curr() → 선점 가능시 resched"]
+        subgraph "Involuntary preemption"
+            P1["Timer interrupt (tick)<br/>-> scheduler_tick()<br/>-> curr->sched_class->task_tick()<br/>-> resched_curr() (set TIF_NEED_RESCHED)"]
+            P2["Interrupt return<br/>-> preempt_schedule_irq()"]
+            P3["Syscall return<br/>-> exit_to_user_mode_loop()<br/>-> check TIF_NEED_RESCHED -> schedule()"]
+            P4["wake_up_process()<br/>-> try_to_wake_up()<br/>-> ttwu_do_activate() -> enqueue<br/>-> check_preempt_curr() -> resched if preemptable"]
         end
 
-        subgraph "프로세스 소멸 시"
-            D1["do_task_dead()<br/>→ __state=TASK_DEAD<br/>→ __schedule() (마지막 스케줄링)<br/>→ finish_task_switch()에서<br/>   put_task_struct()으로 정리"]
+        subgraph "Process destruction"
+            D1["do_task_dead()<br/>-> __state=TASK_DEAD<br/>-> __schedule() (final scheduling)<br/>-> finish_task_switch()<br/>   cleans up via put_task_struct()"]
         end
     end
 
@@ -363,193 +438,338 @@ graph TB
     style D1 fill:#e3f2fd
 ```
 
-### 3.3 x86_64에서의 CPU 상태 전환 상세
+### 3.3 Detailed CPU State Switch on x86_64
 
-전환 시 저장/복원되는 CPU 상태:
+The following table enumerates all CPU state that must be saved and restored during a context switch on x86_64:
 
-| 분류 | 항목 | 저장 위치 | 전환 함수 |
-|------|------|-----------|-----------|
-| 범용 레지스터 | rbp, rbx, r12-r15 | 커널 스택 (push/pop) | `__switch_to_asm` |
-| 스택 포인터 | rsp | `thread.sp` | `__switch_to_asm` |
-| 페이지 테이블 | CR3 | `mm->pgd` | `switch_mm_irqs_off` |
-| FPU/SSE/AVX | xmm, ymm, zmm 등 | `fpu->__fpstate` | `switch_fpu` |
-| 세그먼트 레지스터 | FS, GS, DS, ES | `thread.fsbase/gsbase/ds/es` | `__switch_to` |
-| TLS | GDT 엔트리 | `thread.tls_array` | `load_TLS` |
-| 메모리 보호 키 | PKRU | `thread.pkru` | `x86_pkru_load` |
-| per-CPU 변수 | `current_task` | GS base 기반 | `raw_cpu_write` |
-| 스택 canary | `__stack_chk_guard` | per-CPU | `__switch_to_asm` |
+| Category | Items | Saved in | Switch function |
+|----------|-------|----------|-----------------|
+| General-purpose registers | rbp, rbx, r12-r15 | Kernel stack (push/pop) | `__switch_to_asm` |
+| Stack pointer | rsp | `thread.sp` | `__switch_to_asm` |
+| Page tables | CR3 | `mm->pgd` | `switch_mm_irqs_off` |
+| FPU/SSE/AVX | xmm, ymm, zmm etc. | `fpu->__fpstate` | `switch_fpu` |
+| Segment registers | FS, GS, DS, ES | `thread.fsbase/gsbase/ds/es` | `__switch_to` |
+| TLS | GDT entries | `thread.tls_array` | `load_TLS` |
+| Memory protection keys | PKRU | `thread.pkru` | `x86_pkru_load` |
+| Per-CPU variable | `current_task` | GS base relative | `raw_cpu_write` |
+| Stack canary | `__stack_chk_guard` | per-CPU | `__switch_to_asm` |
 
 ---
 
-## 4. 프로세스 소멸
+## 4. Process Destruction
 
-### 4.1 전체 소멸 과정
+### 4.1 Two Paths to Death: exit() and Fatal Signals
+
+A process can terminate in two fundamentally different ways: by voluntarily calling `exit()` (or `exit_group()`), or by receiving a fatal signal (such as `SIGKILL`, `SIGSEGV`, or `SIGTERM` with default disposition). Although the triggers differ, both paths converge on the same function: `do_exit()`.
+
+**Voluntary exit:** When a process calls `exit()` (the single-thread variant), the syscall handler invokes `do_exit(code)` directly. When it calls `exit_group()`, the handler invokes `do_group_exit()` (`exit.c:1086`), which first sets `SIGNAL_GROUP_EXIT` on the thread group's `signal_struct`, then calls `zap_other_threads(current)` to send `SIGKILL` to every other thread in the group. After that, it calls `do_exit()`. Both `do_group_exit()` and `do_exit()` are annotated `__noreturn` — they never return to their caller.
+
+**Signal-based termination:** When a fatal signal is delivered to a process, the signal delivery mechanism takes a different entry path. The function `complete_signal()` (`signal.c:963`) is called as part of `__send_signal_locked()`. For signals that are fatal and do not produce a core dump (e.g., `SIGKILL`, `SIGTERM`), `complete_signal()` immediately sets `SIGNAL_GROUP_EXIT` on the signal struct and force-enqueues `SIGKILL` on every thread in the thread group, waking each one with `signal_wake_up()`.
+
+Each woken thread, upon returning from its current syscall or interrupt, enters the signal processing path. The function `get_signal()` (`signal.c:2799`) is called from the architecture-specific return-to-user-mode code. When `get_signal()` sees that `SIGNAL_GROUP_EXIT` is already set, it jumps directly to the fatal exit path, sets `PF_SIGNALED` on the task, and calls `do_group_exit(signr)`. For core-dumping signals (e.g., `SIGSEGV`, `SIGABRT`), `get_signal()` first calls `vfs_coredump()` to write the core dump, then proceeds to `do_group_exit()`.
+
+The complete signal-to-death chain is: signal sent -> `__send_signal_locked()` -> `complete_signal()` (wakes all threads, sets `SIGNAL_GROUP_EXIT`) -> each thread returns to user mode -> `get_signal()` -> `do_group_exit()` -> `do_exit()` -> `do_task_dead()` -> `__schedule()` -> never returns.
 
 ```mermaid
 sequenceDiagram
-    participant U as 유저 프로세스
+    participant SRC as Signal source<br/>(kill, kernel, hardware)
+    participant SIG as __send_signal_locked()<br/>signal.c
+    participant CS as complete_signal()<br/>signal.c:963
+    participant THR as Target thread(s)
+    participant GS as get_signal()<br/>signal.c:2799
+    participant DGE as do_group_exit()<br/>exit.c:1086
+    participant DE as do_exit()<br/>exit.c:896
+    participant DTD as do_task_dead()<br/>core.c:6880
+
+    Note over SRC: Voluntary: sys_exit() / sys_exit_group()
+    SRC->>DGE: do_group_exit(exit_code)
+    DGE->>DGE: signal->flags = SIGNAL_GROUP_EXIT<br/>zap_other_threads(current)
+    DGE->>DE: do_exit(exit_code)
+
+    Note over SRC: Signal-based: kill(), SIGSEGV, etc.
+    SRC->>SIG: send signal to process
+    SIG->>CS: complete_signal(sig, p, type)
+    Note over CS: For fatal non-coredump signals:<br/>signal->flags = SIGNAL_GROUP_EXIT<br/>signal->group_exit_code = sig<br/>Force SIGKILL on all threads<br/>signal_wake_up() each thread
+
+    CS-->>THR: Threads woken up
+    Note over THR: Return from syscall/interrupt
+
+    THR->>GS: get_signal(&ksig)
+    Note over GS: Sees SIGNAL_GROUP_EXIT set<br/>-> goto fatal<br/>current->flags |= PF_SIGNALED
+
+    alt Core dump signal (SIGSEGV, SIGABRT, etc.)
+        GS->>GS: vfs_coredump(&ksig->info)
+    end
+
+    GS->>DGE: do_group_exit(signr)
+    DGE->>DE: do_exit(exit_code)
+    DE->>DTD: do_task_dead()
+    Note over DTD: set_special_state(TASK_DEAD)<br/>__schedule(SM_NONE)<br/>-- never returns --
+```
+
+### 4.2 The Role of do_exit()
+
+The function `do_exit()` (`exit.c:896`) is the central teardown routine for a dying process. It is declared as `void __noreturn do_exit(long code)` — meaning the compiler guarantees (and relies on the fact) that this function will never return. Everything after the call to `do_exit()` is dead code.
+
+The function proceeds through several phases of cleanup, executed in a carefully ordered sequence:
+
+**Phase 1 — Early cleanup:** `synchronize_group_exit()` sets `SIGNAL_GROUP_EXIT` and handles coredump serialization. Then `exit_signals()` sets the `PF_EXITING` flag on the current task, which serves as a signal to other parts of the kernel that this task is in the process of dying and should not receive further signals. `ptrace_event(PTRACE_EVENT_EXIT)` notifies any attached debugger, and `io_uring_files_cancel()` cancels outstanding asynchronous I/O operations.
+
+**Phase 2 — Resource release:** This is the bulk of the function. Resources are released in a specific order that avoids use-after-free and lock ordering problems:
+
+1. `exit_mm()` — Releases the user memory address space first, because after this point no user-space memory accesses will occur. Releasing the mm early also returns potentially large amounts of COW memory to the system as soon as possible. After `exit_mm()`, the `active_mm` can be borrowed by kernel threads via lazy TLB.
+2. `exit_sem()` — Cleans up System V semaphore undo lists.
+3. `exit_shm()` — Detaches shared memory segments.
+4. `exit_files()` — Closes all open file descriptors (including sockets and pipes).
+5. `exit_fs()` — Releases filesystem context (current working directory and root references).
+6. `disassociate_ctty(1)` — Detaches the controlling terminal (relevant for session leaders).
+7. `exit_nsproxy_namespaces()` — Drops namespace references.
+8. `exit_thread()` — Architecture-specific cleanup (e.g., I/O permission bitmaps on x86).
+9. `exit_io_context()` — Releases the block I/O scheduler context.
+
+The reason `exit_mm()` comes first is threefold: the file close operations that follow do not need to access user-space memory; after releasing mm, the `active_mm` remains available for the kernel to borrow; and releasing COW pages early frees potentially large amounts of physical memory for other processes.
+
+**Phase 3 — Parent notification:** `exit_notify()` (`exit.c:736`) performs two critical actions. First, `forget_original_parent()` reparents all of the dying task's children to either a subreaper or `init` (PID 1). Second, it sets `tsk->exit_state = EXIT_ZOMBIE`. If the parent has set `SA_NOCLDWAIT` or `SIGCHLD` to `SIG_IGN`, the task is auto-reaped: `exit_state` is set to `EXIT_DEAD` and `release_task()` is called immediately, skipping the zombie state entirely. Otherwise, `do_notify_parent()` sends `SIGCHLD` to the parent and wakes it from any `wait()` call.
+
+**Phase 4 — Final scheduling (the point of no return):** After RCU cleanup (`exit_rcu()`, `exit_tasks_rcu_finish()`), the function calls `preempt_disable()` at line 1007 of `exit.c`. From this point, the task must not sleep or be preempted — it is about to die. The final call is `do_task_dead()`.
+
+### 4.3 do_task_dead() and Why a Process Cannot Free Its Own Stack
+
+The function `do_task_dead()` (`core.c:6880`) is the true point of no return. Its implementation is remarkably short:
+
+```c
+void __noreturn do_task_dead(void)
+{
+    set_special_state(TASK_DEAD);
+    current->flags |= PF_NOFREEZE;
+    __schedule(SM_NONE);
+    BUG();
+    for (;;)
+        cpu_relax();
+}
+```
+
+`set_special_state(TASK_DEAD)` atomically sets the task's `__state` to `TASK_DEAD` (value `0x0080`) while holding the `pi_lock`, which serializes against any in-flight wakeup attempts. The `PF_NOFREEZE` flag tells the freezer subsystem to ignore this task. Then `__schedule(SM_NONE)` is called directly — not through the normal `schedule()` wrapper, because the normal wrapper loops on `need_resched()`, which is not appropriate for a task that is about to die.
+
+Inside `__schedule()`, because the task's state is `TASK_DEAD` (non-zero, non-running), `try_to_block_task()` dequeues it from the runqueue. The scheduler then picks the next task, and `context_switch()` physically switches the CPU's stack pointer to the new task's kernel stack via `switch_to()`.
+
+Here lies the fundamental reason why a process cannot clean up after itself: **at the moment of the context switch, the dying task is still using its own kernel stack**. Every local variable, every return address, every function frame from `do_exit()` through `do_task_dead()` through `__schedule()` through `context_switch()` to `switch_to()` — all of these live on the dying task's kernel stack. If the task attempted to free its own stack before calling `switch_to()`, the CPU would immediately fault, because it would be executing code with a stack pointer pointing to freed memory.
+
+Therefore, the cleanup of the dead task's stack and `task_struct` is delegated to the **next task that runs on the same CPU**. After the stack pointer switches, the CPU is executing on the new task's stack. The new task calls `finish_task_switch(prev)`, where `prev` points to the dead task. Inside `finish_task_switch()`, the code checks whether `prev_state == TASK_DEAD`, and if so:
+
+1. Calls `prev->sched_class->task_dead(prev)` for scheduling-class-specific cleanup.
+2. Calls `put_task_stack(prev)` to release the kernel stack memory.
+3. Calls `put_task_struct_rcu_user(prev)` to drop the RCU user reference, which schedules `delayed_put_task_struct()` to run after an RCU grace period.
+
+This is why `do_task_dead()` ends with `do_exit()` calling `__schedule()` as its final act — it is not merely "finishing with a schedule call" but rather the only possible mechanism for the task to hand off its own physical resources to another entity that can safely free them.
+
+The `BUG()` and `for (;;) cpu_relax()` after `__schedule()` are unreachable code. They exist as a defensive measure: `BUG()` will panic the kernel if `__schedule()` somehow returns (which should be impossible for a `TASK_DEAD` task), and the infinite `cpu_relax()` loop prevents the compiler from complaining about falling off the end of a `__noreturn` function if `BUG()` is compiled as a no-op.
+
+### 4.4 The `__noreturn` Attribute
+
+Both `do_exit()` and `do_task_dead()` are declared with the `__noreturn` attribute, defined in `include/linux/compiler_attributes.h:262` as:
+
+```c
+#define __noreturn  __attribute__((__noreturn__))
+```
+
+This GCC/Clang attribute informs the compiler that the function will never return to its caller. The compiler uses this information in several important ways:
+
+1. **Dead code elimination:** Any code following a call to a `__noreturn` function is provably unreachable. The compiler can safely discard it, reducing binary size.
+2. **Epilogue omission:** The compiler does not need to generate function epilogue code (stack frame teardown, return instruction) for the calling function after the call site.
+3. **Warning suppression:** Without `__noreturn`, the compiler would emit warnings like "control reaches end of non-void function" for callers of `do_exit()`, since many code paths invoke `do_exit()` without an explicit return statement afterward.
+4. **Optimization propagation:** The compiler can propagate the "does not return" information upward through the call graph, enabling further optimizations in callers.
+
+For `do_task_dead()` specifically, the `__noreturn` contract is upheld because `__schedule()` performs a context switch that physically replaces the CPU's execution context — from the dying task's perspective, the instruction pointer never returns past the `switch_to()` call. The `BUG()` after `__schedule()` is a runtime assertion that this invariant holds, and the `for (;;) cpu_relax()` loop is a compile-time safeguard against `BUG()` being defined as a no-op in some kernel configurations.
+
+### 4.5 The Full Termination Sequence
+
+The following diagram traces the complete path from process exit to final memory reclamation, covering both voluntary exit and signal-based termination.
+
+```mermaid
+sequenceDiagram
+    participant U as User process
     participant SYS as syscall
-    participant DGE as do_group_exit()<br/>exit.c:1087
+    participant DGE as do_group_exit()<br/>exit.c:1086
     participant DE as do_exit()<br/>exit.c:896
     participant EN as exit_notify()<br/>exit.c:736
-    participant PR as 부모 프로세스
+    participant PR as Parent process
     participant RT as release_task()<br/>exit.c:244
-    participant SCHED as 스케줄러
+    participant SCHED as Scheduler
+    participant FTS as finish_task_switch()<br/>core.c:5075
     participant RCU as RCU callback
 
-    U->>SYS: exit(code) 또는 exit_group(code)
+    U->>SYS: exit(code) or exit_group(code)
     SYS->>DGE: do_group_exit((code & 0xff) << 8)
-    Note over DGE: signal->flags = SIGNAL_GROUP_EXIT<br/>zap_other_threads(current)<br/>→ 같은 스레드 그룹의 다른 스레드에 SIGKILL
+    Note over DGE: signal->flags = SIGNAL_GROUP_EXIT<br/>zap_other_threads(current)<br/>-> send SIGKILL to other threads in group
 
     DGE->>DE: do_exit(exit_code)
 
     rect rgb(255, 245, 230)
-        Note over DE: === Phase 1: 조기 정리 ===
-        DE->>DE: exit_signals(tsk) — PF_EXITING 설정
+        Note over DE: === Phase 1: Early cleanup ===
+        DE->>DE: synchronize_group_exit() -- set group exit state
+        DE->>DE: exit_signals(tsk) -- set PF_EXITING
         DE->>DE: ptrace_event(PTRACE_EVENT_EXIT)
         DE->>DE: io_uring_files_cancel()
     end
 
     rect rgb(255, 235, 205)
-        Note over DE: === Phase 2: 리소스 해제 (순서 중요!) ===
-        DE->>DE: exit_mm() — 메모리 주소 공간 해제
-        DE->>DE: exit_sem() — System V 세마포어
-        DE->>DE: exit_shm() — 공유 메모리
-        DE->>DE: exit_files() — 파일 디스크립터 닫기
-        DE->>DE: exit_fs() — 파일시스템 컨텍스트
-        DE->>DE: disassociate_ctty(1) — 제어 터미널 분리
-        DE->>DE: exit_nsproxy_namespaces() — 네임스페이스
-        DE->>DE: exit_thread() — 아키텍처별 정리
+        Note over DE: === Phase 2: Resource release (order matters!) ===
+        DE->>DE: exit_mm() -- release memory address space
+        DE->>DE: exit_sem() -- System V semaphores
+        DE->>DE: exit_shm() -- shared memory
+        DE->>DE: exit_files() -- close file descriptors
+        DE->>DE: exit_fs() -- filesystem context
+        DE->>DE: disassociate_ctty(1) -- detach controlling terminal
+        DE->>DE: exit_nsproxy_namespaces() -- namespaces
+        DE->>DE: exit_thread() -- arch-specific cleanup
         DE->>DE: exit_io_context()
     end
 
     rect rgb(220, 240, 255)
-        Note over DE,EN: === Phase 3: 부모 통지 ===
+        Note over DE,EN: === Phase 3: Parent notification ===
         DE->>EN: exit_notify(tsk, group_dead)
         EN->>EN: forget_original_parent(tsk, &dead)
-        Note over EN: 자식 프로세스들을 reaper(init)에게 재배정<br/>(reparenting)
+        Note over EN: Reparent children to reaper (init)
         EN->>EN: tsk->exit_state = EXIT_ZOMBIE
 
-        alt 부모가 SA_NOCLDWAIT 또는 SIG_IGN
+        alt Parent set SA_NOCLDWAIT or SIG_IGN
             EN->>EN: tsk->exit_state = EXIT_DEAD (autoreap)
-            EN->>RT: release_task(tsk) — 즉시 해제
-        else 일반 종료
+            EN->>RT: release_task(tsk) -- immediate release
+        else Normal exit
             EN->>PR: do_notify_parent(tsk, SIGCHLD)
-            Note over PR: siginfo 구성:<br/>si_code = CLD_EXITED / CLD_KILLED<br/>si_status = exit_code or signal<br/>__wake_up_parent()로 wait() 깨움
+            Note over PR: Compose siginfo:<br/>si_code = CLD_EXITED / CLD_KILLED<br/>si_status = exit_code or signal<br/>__wake_up_parent() wakes wait()
         end
     end
 
     rect rgb(255, 220, 220)
-        Note over DE,SCHED: === Phase 4: 최종 스케줄링 ===
+        Note over DE,SCHED: === Phase 4: Final scheduling (point of no return) ===
+        DE->>DE: preempt_disable()
         DE->>DE: exit_rcu() / exit_tasks_rcu_finish()
         DE->>SCHED: do_task_dead()
-        Note over SCHED: __state = TASK_DEAD<br/>__schedule(SM_NONE) — 마지막 스케줄 호출<br/>→ 다른 태스크로 전환<br/>→ finish_task_switch()에서:<br/>   put_task_struct_rcu_user(prev)
+        Note over SCHED: set_special_state(TASK_DEAD)<br/>__schedule(SM_NONE) -- final schedule call<br/>-> context_switch to next task
+        SCHED->>FTS: finish_task_switch(prev=dead task)
+        Note over FTS: Running on NEW task's stack now<br/>prev_state == TASK_DEAD detected<br/>put_task_stack(prev) -- free kernel stack<br/>put_task_struct_rcu_user(prev)
     end
 
-    Note over PR: (나중에) wait4() / waitpid() 호출
+    Note over PR: (Later) wait4() / waitpid() called
     PR->>RT: release_task(zombie)
 
     rect rgb(230, 255, 230)
-        Note over RT: === Phase 5: task_struct 완전 제거 ===
-        RT->>RT: __exit_signal() — 시그널 구조 정리, unhash
-        RT->>RT: __unhash_process() — PID/태스크 리스트에서 제거
-        RT->>RT: proc_flush_pid() — /proc 엔트리 제거
+        Note over RT: === Phase 5: Complete removal of task_struct ===
+        RT->>RT: __exit_signal() -- signal structure cleanup, unhash
+        RT->>RT: __unhash_process() -- remove from PID/task lists
+        RT->>RT: proc_flush_pid() -- remove /proc entry
         RT->>RCU: put_task_struct_rcu_user(p)
 
-        Note over RCU: RCU grace period 후:
+        Note over RCU: After RCU grace period:
         RCU->>RCU: delayed_put_task_struct()
         RCU->>RCU: __put_task_struct()
         Note over RCU: io_uring_free()<br/>cgroup_task_free()<br/>security_task_free()<br/>exit_creds()<br/>put_signal_struct()
         RCU->>RCU: free_task()
-        Note over RCU: 커널 스택 해제<br/>arch_release_task_struct()<br/>free_task_struct()<br/>→ kmem_cache_free()
+        Note over RCU: Release kernel stack<br/>arch_release_task_struct()<br/>free_task_struct()<br/>-> kmem_cache_free()
     end
 ```
 
-### 4.2 리소스 해제 순서와 이유
+### 4.6 Resource Release Order and Rationale
+
+The order in which `do_exit()` releases resources is not arbitrary. Each step is placed to avoid use-after-free conditions, lock ordering deadlocks, and unnecessary resource retention:
 
 ```
-do_exit() 내 리소스 해제 순서:
+Resource release order inside do_exit():
 
-1. exit_mm()          ← 가장 먼저: 유저 메모리는 더 이상 접근 안 함
-2. exit_sem()         ← IPC 세마포어 undo 리스트 정리
-3. exit_shm()         ← 공유 메모리 세그먼트 분리
-4. exit_files()       ← 열린 파일 닫기 (소켓, 파이프 포함)
-5. exit_fs()          ← cwd, root 참조 해제
-6. disassociate_ctty() ← 제어 터미널 분리 (세션 리더인 경우)
-7. exit_nsproxy_namespaces() ← 네임스페이스 참조 해제
-8. exit_thread()      ← 아키텍처별 정리 (I/O 비트맵 등)
-9. exit_io_context()  ← 블록 I/O 스케줄러 컨텍스트
+1. exit_mm()                <- First: user memory is no longer accessed
+2. exit_sem()               <- IPC semaphore undo list cleanup
+3. exit_shm()               <- Shared memory segment detach
+4. exit_files()             <- Close open files (sockets, pipes included)
+5. exit_fs()                <- Release cwd, root references
+6. disassociate_ctty()      <- Detach controlling terminal (if session leader)
+7. exit_nsproxy_namespaces()<- Release namespace references
+8. exit_thread()            <- Architecture-specific cleanup (I/O bitmap, etc.)
+9. exit_io_context()        <- Block I/O scheduler context
 
-mm이 가장 먼저 해제되는 이유:
-- 파일 close 등에서 유저 공간 접근이 필요 없음
-- mm 해제 후 active_mm은 커널이 빌려쓸 수 있음
-- COW 페이지 등 대량 메모리를 조기 반환
+Why mm is released first:
+- File close operations do not need user-space memory access
+- After mm release, active_mm can be borrowed by kernel threads
+- COW pages and other large memory allocations are returned early
 ```
 
-### 4.3 Zombie와 Wait의 관계
+### 4.7 Zombies and the wait() Relationship
+
+When a process finishes `do_exit()`, it does not simply vanish. Its `task_struct` lingers in one of two states: `EXIT_ZOMBIE` or `EXIT_DEAD`.
+
+A zombie is a process that has released all of its resources (memory, files, etc.) but whose `task_struct` still exists because the parent has not yet called `wait()` to collect the exit status. The zombie is extremely lightweight — it holds only the `task_struct` shell with the exit code. Once the parent calls `wait()` (which internally calls `do_wait()` -> `wait_task_zombie()`), `release_task()` is invoked, which unhashes the process from all PID tables, removes its `/proc` entry, and schedules the final RCU-deferred `free_task()`.
+
+In the autoreap path, the zombie state is skipped entirely. If the parent has set `SA_NOCLDWAIT` or has `SIGCHLD` set to `SIG_IGN`, `exit_notify()` sets the exit state directly to `EXIT_DEAD` and calls `release_task()` immediately.
+
+If the parent dies before the child, `forget_original_parent()` reparents the child to `init` (PID 1) or the nearest subreaper process. The `init` process continuously calls `wait()` in a loop, ensuring that orphaned zombies are reaped promptly.
 
 ```mermaid
 graph TB
-    subgraph "프로세스 종료 → Zombie → 완전 제거"
-        A["do_exit() 완료"]
-        B["EXIT_ZOMBIE<br/>(task_struct만 남음)<br/>mm, files, fs 등은 이미 해제됨"]
-        C["부모의 wait() / waitpid()"]
+    subgraph "Process termination -> Zombie -> Complete removal"
+        A["do_exit() completed"]
+        B["EXIT_ZOMBIE<br/>(only task_struct remains)<br/>mm, files, fs already released"]
+        C["Parent's wait() / waitpid()"]
         D["release_task()"]
         E["EXIT_DEAD"]
-        F["free_task()<br/>(메모리 완전 반환)"]
+        F["free_task()<br/>(memory fully returned)"]
     end
 
     A -->|"exit_notify()"| B
-    B -->|"부모가 SIGCHLD 받고"| C
-    C -->|"do_wait() → wait_task_zombie()"| D
+    B -->|"Parent receives SIGCHLD"| C
+    C -->|"do_wait() -> wait_task_zombie()"| D
     D --> E --> F
 
-    subgraph "autoreap 경로 (zombie 건너뜀)"
-        AR["부모가 SA_NOCLDWAIT<br/>또는 SIGCHLD=SIG_IGN"]
+    subgraph "Autoreap path (skip zombie)"
+        AR["Parent set SA_NOCLDWAIT<br/>or SIGCHLD=SIG_IGN"]
     end
-    A -->|"exit_notify()에서 autoreap"| AR
-    AR -->|"바로 release_task()"| E
+    A -->|"autoreap in exit_notify()"| AR
+    AR -->|"immediate release_task()"| E
 
-    subgraph "부모가 먼저 죽는 경우"
+    subgraph "Parent dies first"
         RP["forget_original_parent()"]
-        INIT["init (PID 1)이<br/>새 부모가 됨"]
+        INIT["init (PID 1)<br/>becomes new parent"]
     end
     RP --> INIT
-    INIT -->|"init의 wait loop"| C
+    INIT -->|"init's wait loop"| C
 ```
 
 ---
 
-## 5. 프로세스의 전체 생애주기 통합 다이어그램
+## 5. Integrated Lifecycle Diagram
+
+The following diagram brings together all phases of a process's life — from creation through scheduling and context switching to final destruction. The blue-highlighted nodes indicate points where the scheduler is directly involved.
+
+A process is born via `fork()`/`clone()` or `kthread_create()`, both of which go through `copy_process()` and `dup_task_struct()`. The scheduler initializes the new task in `sched_fork()` and inserts it into the runqueue via `wake_up_new_task()`. During its lifetime, the task cycles between `TASK_RUNNING` and various sleep states, with the scheduler mediating every transition via timer ticks, preemption checks, wakeups, and context switches. At death, `do_exit()` tears down resources, `do_task_dead()` performs the final context switch, and the zombie is reaped by the parent's `wait()` call.
 
 ```mermaid
 graph TB
-    subgraph "탄생"
+    subgraph "Birth"
         FORK["fork() / clone()"]
         KCREATE["kthread_create()"]
         COPY["copy_process()<br/>dup_task_struct()"]
-        SCHED_FORK["sched_fork()<br/>🔷 스케줄러: 초기화"]
-        WAKE["wake_up_new_task()<br/>🔷 스케줄러: 런큐 삽입"]
+        SCHED_FORK["sched_fork()<br/>Scheduler: init"]
+        WAKE["wake_up_new_task()<br/>Scheduler: enqueue"]
     end
 
-    subgraph "생존"
-        RUN["TASK_RUNNING<br/>(실행 중 또는 실행 대기)"]
-        SLEEP_I["TASK_INTERRUPTIBLE<br/>(시그널로 깨울 수 있는 수면)"]
-        SLEEP_U["TASK_UNINTERRUPTIBLE<br/>(깨울 수 없는 수면)"]
+    subgraph "Life"
+        RUN["TASK_RUNNING<br/>(executing or ready to execute)"]
+        SLEEP_I["TASK_INTERRUPTIBLE<br/>(sleep, can be woken by signal)"]
+        SLEEP_U["TASK_UNINTERRUPTIBLE<br/>(sleep, only woken by event)"]
         STOPPED["__TASK_STOPPED"]
 
-        TICK["scheduler_tick()<br/>🔷 스케줄러: 타이머 틱"]
-        PREEMPT["선점 검사<br/>🔷 TIF_NEED_RESCHED"]
-        CS["context_switch()<br/>🔷 스케줄러: CPU 전환"]
-        WAKEUP["try_to_wake_up()<br/>🔷 스케줄러: 깨우기"]
+        TICK["scheduler_tick()<br/>Scheduler: timer tick"]
+        PREEMPT["Preemption check<br/>TIF_NEED_RESCHED"]
+        CS["context_switch()<br/>Scheduler: CPU switch"]
+        WAKEUP["try_to_wake_up()<br/>Scheduler: wakeup"]
     end
 
-    subgraph "죽음"
+    subgraph "Death"
         EXIT["do_exit()"]
         ZOMBIE["EXIT_ZOMBIE"]
         DEAD["EXIT_DEAD"]
-        FREE["free_task()<br/>메모리 반환"]
-        TASK_DEAD_STATE["do_task_dead()<br/>🔷 스케줄러: 최종 전환"]
+        FREE["free_task()<br/>memory returned"]
+        TASK_DEAD_STATE["do_task_dead()<br/>Scheduler: final switch"]
     end
 
     FORK --> COPY
@@ -557,20 +777,20 @@ graph TB
     COPY --> SCHED_FORK --> WAKE --> RUN
 
     RUN <-->|"schedule()"| CS
-    RUN -->|"wait_event() 등"| SLEEP_I
-    RUN -->|"I/O, mutex 등"| SLEEP_U
+    RUN -->|"wait_event() etc."| SLEEP_I
+    RUN -->|"I/O, mutex etc."| SLEEP_U
     RUN -->|"SIGSTOP"| STOPPED
-    SLEEP_I -->|"wake_up() / 시그널"| WAKEUP
+    SLEEP_I -->|"wake_up() / signal"| WAKEUP
     SLEEP_U -->|"wake_up()"| WAKEUP
     STOPPED -->|"SIGCONT"| WAKEUP
     WAKEUP --> RUN
 
-    TICK -->|"time slice 소진"| PREEMPT
+    TICK -->|"time slice expired"| PREEMPT
     PREEMPT -->|"resched_curr()"| CS
 
     RUN --> EXIT
     EXIT --> TASK_DEAD_STATE --> ZOMBIE
-    ZOMBIE -->|"부모 wait()"| DEAD --> FREE
+    ZOMBIE -->|"parent wait()"| DEAD --> FREE
 
     style SCHED_FORK fill:#bbdefb
     style WAKE fill:#bbdefb
@@ -581,31 +801,34 @@ graph TB
     style TASK_DEAD_STATE fill:#bbdefb
 ```
 
-> 🔷 표시는 스케줄러가 직접 관여하는 지점
+> Blue-highlighted nodes indicate points where the scheduler is directly involved.
 
 ---
 
-## 6. 주요 함수 빠른 참조
+## 6. Function Quick Reference
 
-| 함수 | 파일:라인 | 역할 |
-|------|-----------|------|
-| `kernel_clone()` | `kernel/fork.c:2610` | fork/clone 진입점 |
-| `copy_process()` | `kernel/fork.c:1966` | 프로세스 깊은 복사 |
-| `dup_task_struct()` | `kernel/fork.c:1052` | task_struct 메모리 복사 |
-| `copy_thread()` | `arch/x86/kernel/process.c:170` | x86 레지스터 프레임 설정 |
-| `sched_fork()` | `kernel/sched/core.c` | 스케줄러 초기화 |
-| `wake_up_new_task()` | `kernel/sched/core.c` | 새 태스크 런큐 삽입 |
-| `kernel_thread()` | `kernel/fork.c:2700` | 커널 스레드 생성 |
-| `kthreadd()` | `kernel/kthread.c:815` | 커널 스레드 데몬 (PID 2) |
-| `schedule()` | `kernel/sched/core.c:6954` | 자발적 스케줄링 진입 |
-| `__schedule()` | `kernel/sched/core.c:6722` | 스케줄링 핵심 로직 |
-| `pick_next_task()` | `kernel/sched/core.c:5971` | 다음 실행 태스크 선택 |
-| `context_switch()` | `kernel/sched/core.c:5201` | mm + 레지스터 전환 총괄 |
-| `__switch_to_asm()` | `arch/x86/entry/entry_64.S:178` | 스택/레지스터 물리 전환 |
-| `__switch_to()` | `arch/x86/kernel/process_64.c:610` | x86 CPU 상태 전환 |
-| `finish_task_switch()` | `kernel/sched/core.c:5075` | 전환 후 정리 (new 스택) |
-| `do_exit()` | `kernel/exit.c:896` | 프로세스 종료 메인 |
-| `exit_notify()` | `kernel/exit.c:736` | 부모 통지 + 자식 재배정 |
-| `release_task()` | `kernel/exit.c:244` | zombie 완전 제거 |
-| `do_task_dead()` | `kernel/sched/core.c:6880` | 마지막 스케줄 호출 |
-| `free_task()` | `kernel/fork.c:528` | task_struct 메모리 해제 |
+| Function | File:Line | Role |
+|----------|-----------|------|
+| `kernel_clone()` | `kernel/fork.c:2610` | fork/clone entry point |
+| `copy_process()` | `kernel/fork.c:1966` | Deep copy of process |
+| `dup_task_struct()` | `kernel/fork.c:1052` | Allocate and copy task_struct |
+| `copy_thread()` | `arch/x86/kernel/process.c:170` | x86 register frame setup |
+| `sched_fork()` | `kernel/sched/core.c` | Scheduler initialization |
+| `wake_up_new_task()` | `kernel/sched/core.c` | Insert new task into runqueue |
+| `kernel_thread()` | `kernel/fork.c:2700` | Create kernel thread |
+| `kthreadd()` | `kernel/kthread.c:815` | Kernel thread daemon (PID 2) |
+| `schedule()` | `kernel/sched/core.c:6954` | Voluntary scheduling entry |
+| `__schedule()` | `kernel/sched/core.c:6722` | Core scheduling logic |
+| `pick_next_task()` | `kernel/sched/core.c:5971` | Select next task to execute |
+| `context_switch()` | `kernel/sched/core.c:5201` | Orchestrate mm + register switch |
+| `__switch_to_asm()` | `arch/x86/entry/entry_64.S:178` | Physical stack/register switch |
+| `__switch_to()` | `arch/x86/kernel/process_64.c:610` | x86 CPU state switch |
+| `finish_task_switch()` | `kernel/sched/core.c:5075` | Post-switch cleanup (on new stack) |
+| `do_exit()` | `kernel/exit.c:896` | Main process termination |
+| `do_group_exit()` | `kernel/exit.c:1086` | Thread group termination |
+| `exit_notify()` | `kernel/exit.c:736` | Parent notification + child reparenting |
+| `release_task()` | `kernel/exit.c:244` | Complete zombie removal |
+| `do_task_dead()` | `kernel/sched/core.c:6880` | Final schedule call |
+| `free_task()` | `kernel/fork.c:528` | Free task_struct memory |
+| `complete_signal()` | `kernel/signal.c:963` | Signal delivery completion |
+| `get_signal()` | `kernel/signal.c:2799` | Dequeue and process signals |
