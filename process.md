@@ -392,7 +392,7 @@ sequenceDiagram
     participant DGE as do_group_exit()<br/>exit.c:1087
     participant DE as do_exit()<br/>exit.c:896
     participant EN as exit_notify()<br/>exit.c:736
-    participant PAR as 부모 프로세스
+    participant PR as 부모 프로세스
     participant RT as release_task()<br/>exit.c:244
     participant SCHED as 스케줄러
     participant RCU as RCU callback
@@ -434,8 +434,8 @@ sequenceDiagram
             EN->>EN: tsk->exit_state = EXIT_DEAD (autoreap)
             EN->>RT: release_task(tsk) — 즉시 해제
         else 일반 종료
-            EN->>PAR: do_notify_parent(tsk, SIGCHLD)
-            Note over PAR: siginfo 구성:<br/>si_code = CLD_EXITED / CLD_KILLED<br/>si_status = exit_code or signal<br/>__wake_up_parent()로 wait() 깨움
+            EN->>PR: do_notify_parent(tsk, SIGCHLD)
+            Note over PR: siginfo 구성:<br/>si_code = CLD_EXITED / CLD_KILLED<br/>si_status = exit_code or signal<br/>__wake_up_parent()로 wait() 깨움
         end
     end
 
@@ -446,8 +446,8 @@ sequenceDiagram
         Note over SCHED: __state = TASK_DEAD<br/>__schedule(SM_NONE) — 마지막 스케줄 호출<br/>→ 다른 태스크로 전환<br/>→ finish_task_switch()에서:<br/>   put_task_struct_rcu_user(prev)
     end
 
-    Note over PAR: (나중에) wait4() / waitpid() 호출
-    PAR->>RT: release_task(zombie)
+    Note over PR: (나중에) wait4() / waitpid() 호출
+    PR->>RT: release_task(zombie)
 
     rect rgb(230, 255, 230)
         Note over RT: === Phase 5: task_struct 완전 제거 ===
