@@ -8,13 +8,138 @@
 
 Every process in the Linux kernel is represented by a `task_struct`, defined at `include/linux/sched.h:819`. This single structure is the kernel's view of a process — it holds the process state, scheduling parameters, PID, kernel stack pointer, and pointers to every resource the process owns. Rather than embedding all data directly, `task_struct` points outward to separate structures that each manage a specific domain of the process's resources.
 
-The `__state` field records the current scheduling state of the task: `TASK_RUNNING`, `TASK_INTERRUPTIBLE`, `TASK_UNINTERRUPTIBLE`, and so on. The `pid` and `tgid` fields identify the task at the individual thread level and the thread group level, respectively. The `void *stack` field points to the base of the kernel stack, which is allocated per-task and is used whenever the CPU is executing kernel code on behalf of this process.
+### 1.1 thread_info — The Low-Level Foundation
 
-The `thread` field, of type `thread_struct`, stores the architecture-specific CPU register state that must be saved and restored during context switches. On x86_64, this includes the stack pointer (`sp`), FS/GS base addresses, I/O permission bitmaps, and floating-point state.
+The very first field of `task_struct` is `struct thread_info`, embedded directly at offset zero (`include/linux/sched.h:822`, when `CONFIG_THREAD_INFO_IN_TASK` is set, which x86_64 always uses). This placement is deliberate: because `thread_info` sits at the start of `task_struct`, casting between the two is a zero-cost pointer identity — `(struct thread_info *)current` and `(struct task_struct *)ti` point to the same address.
+
+The `thread_info` structure is architecture-specific. On x86_64 (`arch/x86/include/asm/thread_info.h:62`), it contains:
+
+```c
+struct thread_info {
+    unsigned long    flags;        /* low level flags */
+    unsigned long    syscall_work; /* SYSCALL_WORK_ flags */
+    u32              status;       /* thread synchronous flags */
+#ifdef CONFIG_SMP
+    u32              cpu;          /* current CPU */
+#endif
+};
+```
+
+The `flags` field is the most important. It is a bitmask that the kernel's entry/exit code checks on every return from interrupt, exception, or syscall. The bits are divided into generic flags (bits 0–15, defined in `include/asm-generic/thread_info_tif.h`) and architecture-specific flags (bits 16+, in `arch/x86/include/asm/thread_info.h`). The most significant ones for understanding process behavior are:
+
+| Flag | Bit | Purpose |
+|------|-----|---------|
+| `TIF_NEED_RESCHED` | 4 | The scheduler has determined this task should yield the CPU. Checked on every return to user mode and at `preempt_enable()`. |
+| `TIF_NEED_RESCHED_LAZY` | 5 | A softer variant — allows the task to continue running until a natural scheduling point (new in kernel 6.x). |
+| `TIF_SIGPENDING` | 1 | At least one signal is pending. Causes the kernel to enter signal delivery on return to user mode. |
+| `TIF_NOTIFY_SIGNAL` | 2 | Lighter-weight signal notification (e.g., for io_uring). |
+| `TIF_NOTIFY_RESUME` | 0 | A callback is pending before returning to user space (used by uprobes, rseq, etc.). |
+| `TIF_POLLING_NRFLAG` | 6 | The idle loop is polling `TIF_NEED_RESCHED` directly rather than waiting for an IPI. |
+| `TIF_NEED_FPU_LOAD` | 19 | FPU/SIMD state must be reloaded before returning to user space (x86-specific). |
+| `TIF_SSBD` | 16 | Speculative Store Bypass Disable (Spectre v4 mitigation, x86-specific). |
+| `TIF_SPEC_IB` | 17 | Indirect branch speculation control (STIBP/IBPB, x86-specific). |
+| `TIF_ADDR32` | 28 | This is a 32-bit process running on a 64-bit kernel (x86-specific). |
+
+The relationship between `TIF_NEED_RESCHED` and the scheduler is central to how preemption works: the scheduler sets this flag (via `resched_curr()`) when it determines that a task should be preempted, and the kernel's entry/exit paths check it at every transition point. This mechanism is explored in depth in Section 5.
+
+The `syscall_work` field holds `SYSCALL_WORK_*` flags that govern syscall-level tracing and filtering. These are checked by the generic entry/exit code (`include/linux/entry-common.h`) on every syscall boundary:
+
+| Flag | Purpose |
+|------|---------|
+| `SYSCALL_WORK_SECCOMP` | Seccomp BPF filtering is active for this task |
+| `SYSCALL_WORK_SYSCALL_TRACE` | ptrace-based syscall tracing (`PTRACE_SYSCALL`) |
+| `SYSCALL_WORK_SYSCALL_TRACEPOINT` | ftrace `sys_enter`/`sys_exit` tracepoints are enabled |
+| `SYSCALL_WORK_SYSCALL_AUDIT` | The audit subsystem is tracing syscalls |
+| `SYSCALL_WORK_SYSCALL_EMU` | Syscall emulation mode (ptrace stops without executing the syscall) |
+| `SYSCALL_WORK_SYSCALL_USER_DISPATCH` | Redirect syscalls to a userspace handler |
+
+The `status` field holds thread-synchronous flags that only the owning thread reads and writes, so no atomic access is needed. On x86_64, the primary flag is `TS_COMPAT` (`0x0002`), which indicates that a 32-bit (ia32) syscall is currently active on this 64-bit thread. The `in_ia32_syscall()` macro reads this flag.
+
+The `cpu` field (present only with `CONFIG_SMP`) records which CPU this task is currently running on.
+
+#### Why x86_64's thread_info Does Not Contain preempt_count
+
+On arm64, `thread_info` embeds the preempt counter directly as a `u64 preempt_count` field (`arch/arm64/include/asm/thread_info.h:30`). This 64-bit field uses a union with a struct to overlay a 32-bit `count` and a 32-bit `need_resched` side by side. When arm64's `__preempt_count_dec_and_test()` decrements the count, it reads the full 64-bit value: if the entire 64 bits are zero, both the preemption nesting depth and the need-resched flag are clear simultaneously, meaning preemption should proceed. This is elegant but requires non-atomic read-modify-write sequences (separate `READ_ONCE` / `WRITE_ONCE`) because arm64 lacks a single instruction that can both decrement and test a memory location in one atomic step.
+
+x86_64 takes a fundamentally different approach: it stores `preempt_count` as a **per-CPU variable** (`DECLARE_PER_CPU_CACHE_HOT(int, __preempt_count)` in `arch/x86/include/asm/preempt.h`) rather than embedding it in `thread_info`. The reason is x86's `GS`-segment-based per-CPU addressing: on x86_64, the `GS` base register points to the per-CPU data area, and accessing a per-CPU variable is a single memory-operand instruction like `decl %gs:offset`. This means `__preempt_count_dec_and_test()` can be implemented as a single `decl` instruction with the zero-flag (`ZF`) test built into the CPU's ALU — if the result is zero, both the preemption count and the `PREEMPT_NEED_RESCHED` bit (bit 31, inverted) are zero, meaning the task is preemptible and needs rescheduling. This is done via the `GEN_UNARY_RMWcc("decl", ...)` macro, which generates a `decl` followed by a conditional branch on `ZF` — all without any load-modify-store sequence.
+
+The per-CPU approach on x86 is faster for the common case because `preempt_enable()` / `preempt_disable()` are among the most frequently called operations in the kernel (they happen at every spinlock acquire/release, every RCU read-side critical section, etc.), and a single `incl`/`decl` with `%gs:` prefix is the tightest possible encoding. On arm64, which lacks segment-based per-CPU addressing, embedding the counter in `thread_info` (accessible via the `SP_EL0` register that always points to `current`) achieves a similarly fast access path. Each architecture chose the representation that maps best to its hardware capabilities.
+
+In summary: the architectural difference exists because x86 has `%gs`-relative per-CPU memory with single-instruction read-modify-write, while arm64 has `SP_EL0`-relative `current` access. Both achieve the same goal — a fast preempt_count check at every `preempt_enable()` — but through different mechanisms.
+
+### 1.2 Process Identification: pid vs. tgid
+
+The `task_struct` contains two identity fields that are often confused: `pid` and `tgid` (`include/linux/sched.h:1060–1061`).
+
+The `pid` field is the kernel's unique identifier for each schedulable entity — every `task_struct` has a distinct `pid`, whether it represents a process or a thread. The `tgid` (Thread Group ID) field identifies the POSIX process: all threads within the same process share the same `tgid`.
+
+When `copy_process()` creates a new task, the assignment depends on the `CLONE_THREAD` flag (`kernel/fork.c:2290–2297`):
+
+```c
+p->pid = pid_nr(pid);       // Always a fresh unique PID
+if (clone_flags & CLONE_THREAD) {
+    p->group_leader = current->group_leader;
+    p->tgid = current->tgid;   // Inherit: same thread group
+} else {
+    p->group_leader = p;
+    p->tgid = p->pid;           // New process: tgid == pid
+}
+```
+
+When `CLONE_THREAD` is set (as `pthread_create()` does internally), the new thread inherits the parent's `tgid` and `group_leader`. When it is not set (as `fork()` does), the new process gets a fresh `tgid` equal to its `pid`, and becomes its own group leader.
+
+This distinction directly maps to POSIX semantics:
+- `getpid()` returns `current->tgid` — the thread group identity, shared by all threads in the process.
+- `gettid()` returns `current->pid` — the unique per-thread identity.
+
+For single-threaded processes, `pid == tgid`. For additional threads, `pid != tgid` but they share the same `tgid`. The `kill()` syscall targets `tgid` (sending to the process), while `tgkill()` can target a specific `pid` (thread).
+
+### 1.3 Family Relationships: real_parent vs. parent
+
+The `task_struct` maintains two parent pointers (`include/linux/sched.h:1067–1076`):
+
+```c
+struct task_struct __rcu    *real_parent;  /* Real parent process */
+struct task_struct __rcu    *parent;       /* Recipient of SIGCHLD, wait4() reports */
+```
+
+Under normal conditions, `parent == real_parent`, and both point to the process that called `fork()` to create this task. They diverge only when **ptrace** is involved.
+
+When a debugger (such as `gdb` or `strace`) attaches to a process via `ptrace(PTRACE_ATTACH, ...)`, the kernel changes `parent` to point to the **tracer** while leaving `real_parent` unchanged. This means:
+
+- `real_parent` always points to the **biological parent** — the process that originally created this task. It never changes unless the biological parent dies (in which case `forget_original_parent()` reparents to `init` or a subreaper).
+- `parent` points to whichever process currently receives `SIGCHLD` and observes this task via `wait4()`. Under ptrace, this is the tracer. When the tracer detaches (or dies), `parent` is restored to `real_parent`.
+
+The process tree is maintained through two additional list heads:
+- `children` — a list of all direct children of this task.
+- `sibling` — links this task into its parent's `children` list.
+
+The tracer maintains a separate list: `ptraced` is a list of all tasks this process is currently tracing, and `ptrace_entry` links the tracee into that list.
+
+### 1.4 Process Traversal and How `ps` Sees Every Process
+
+The `task_struct` contains a `struct list_head tasks` field (`include/linux/sched.h:957`) that links every thread group leader into a global circular doubly-linked list, anchored at `init_task.tasks` (the idle task, PID 0). The kernel provides the macro `for_each_process()` (`include/linux/sched/signal.h:636`) to walk this list:
+
+```c
+#define for_each_process(p) \
+    for (p = &init_task ; (p = next_task(p)) != &init_task ; )
+```
+
+This iterates over one `task_struct` per process (the thread group leader), not per thread. To iterate over all threads within a process, the kernel uses `for_each_thread(p, t)`, which walks the `signal_struct.thread_head` list via each thread's `thread_node`. The combined macro `for_each_process_thread(p, t)` visits every thread of every process.
+
+When the `ps -ef` command enumerates all processes, it reads the `/proc` filesystem. The `/proc` directory contains one numeric subdirectory per process (e.g., `/proc/1`, `/proc/1234`). The kernel does not simply walk the `tasks` linked list to populate `/proc`. Instead, `proc_pid_readdir()` (`fs/proc/base.c:3536`) uses the PID namespace's **radix tree** via `find_ge_pid()` ("find PID greater than or equal to X"). This radix-tree-based lookup is `O(log N)` per step and supports efficient seek/resume across `getdents()` calls, which is important because `readdir()` may be called multiple times with different starting positions.
+
+For each process found, `/proc` creates a directory named after the `tgid` (not the per-thread `pid`). Inside each process directory, the `/proc/[tgid]/task/` subdirectory lists individual threads by their `pid`. The information shown by `ps` — PID, PPID, state, command name, CPU time, etc. — is all read directly from the corresponding `task_struct` fields through the proc filesystem's handlers.
+
+### 1.5 Other Key Fields and Pointers
+
+The `__state` field records the current scheduling state of the task: `TASK_RUNNING`, `TASK_INTERRUPTIBLE`, `TASK_UNINTERRUPTIBLE`, and so on. The `void *stack` field points to the base of the kernel stack, which is allocated per-task and is used whenever the CPU is executing kernel code on behalf of this process.
+
+The `thread` field, of type `thread_struct`, stores the architecture-specific CPU register state that must be saved and restored during context switches. On x86_64, this includes the stack pointer (`sp`), FS/GS base addresses, I/O permission bitmaps, and floating-point state. (This is distinct from `thread_info`, which holds low-level flags; `thread_struct` holds the full saved register context.)
 
 Scheduling is governed by a trio of embedded entities: `sched_entity` (for CFS), `sched_rt_entity` (for real-time), and `sched_dl_entity` (for deadline scheduling). The `sched_class` pointer determines which scheduling class currently governs this task.
 
-The exit-related fields — `exit_state`, `exit_code`, and `exit_signal` — track whether the process is alive, a zombie awaiting reaping, or fully dead. The family relationship fields (`real_parent`, `parent`, `children`, `sibling`, `group_leader`) form the process tree that determines signal delivery and wait semantics.
+The exit-related fields — `exit_state`, `exit_code`, and `exit_signal` — track whether the process is alive, a zombie awaiting reaping, or fully dead.
 
 Each `task_struct` points to the following shared or per-process structures:
 
@@ -29,11 +154,12 @@ Each `task_struct` points to the following shared or per-process structures:
 
 The `sched_entity` embedded in `task_struct` contains a `rb_node run_node` used to position the task within the CFS red-black tree, and a `u64 vruntime` that records the task's virtual runtime — the key by which CFS orders tasks for fairness.
 
-### 1.1 task_struct Overall Structure
+### 1.6 task_struct Overall Structure
 
 ```mermaid
 graph TB
     subgraph "task_struct (include/linux/sched.h:819)"
+        TS_TI["thread_info (first field)<br/>flags, syscall_work, status, cpu"]
         TS_STATE["__state: unsigned int<br/>TASK_RUNNING | INTERRUPTIBLE | ..."]
         TS_PID["pid / tgid"]
         TS_STACK["void *stack (kernel stack)"]
@@ -41,6 +167,7 @@ graph TB
         TS_SCHED["sched_class *<br/>se: sched_entity<br/>rt: sched_rt_entity<br/>dl: sched_dl_entity"]
         TS_EXIT["exit_state / exit_code / exit_signal"]
         TS_REL["real_parent / parent<br/>children / sibling / group_leader"]
+        TS_TASKS["tasks: list_head<br/>(global process list)"]
     end
 
     TS_STATE --- MM["mm_struct *mm<br/>(user address space)"]
@@ -60,9 +187,11 @@ graph TB
     SE --> VRT["u64 vruntime<br/>(virtual runtime)"]
 
     FILES --> FDT["fdtable<br/>(fd -> file * mapping)"]
+
+    TS_TASKS --> INIT["init_task.tasks<br/>(global circular list anchor)"]
 ```
 
-### 1.2 Scheduler-Related Data Structures
+### 1.7 Scheduler-Related Data Structures
 
 The scheduler operates on a per-CPU `struct rq` (runqueue), defined at `kernel/sched/sched.h:1119`. Each runqueue holds a spinlock, a count of runnable tasks (`nr_running`), pointers to the currently executing task (`curr`) and the idle task (`idle`), and embedded sub-runqueues for each scheduling class: `cfs_rq`, `rt_rq`, and `dl_rq`.
 
@@ -111,7 +240,7 @@ graph LR
     SC_STOP -->|"high ->"| SC_DL --> SC_RT --> SC_FAIR --> SC_IDLE
 ```
 
-### 1.3 task_struct State Transitions
+### 1.8 task_struct State Transitions
 
 A task begins its life in the `TASK_NEW` state, set by `copy_process()` during creation. When `wake_up_new_task()` is called, it transitions to `TASK_RUNNING` and becomes eligible for scheduling. From `TASK_RUNNING`, a task may enter `TASK_INTERRUPTIBLE` (sleeping but can be woken by signals) or `TASK_UNINTERRUPTIBLE` (sleeping, only woken by the specific event it awaits — commonly I/O completion). It can also be stopped via `SIGSTOP` or traced via `ptrace`.
 
@@ -177,7 +306,7 @@ The parent receives the child's PID as the return value of `fork()`. The child, 
 | `CLONE_FILES` | Share files_struct | Copy |
 | `CLONE_FS` | Share fs_struct | Copy |
 | `CLONE_SIGHAND` | Share sighand | Copy |
-| `CLONE_THREAD` | Same thread group | New thread group |
+| `CLONE_THREAD` | Same thread group (tgid inherited) | New thread group (tgid = pid) |
 
 ```mermaid
 sequenceDiagram
@@ -736,7 +865,103 @@ graph TB
 
 ---
 
-## 5. Integrated Lifecycle Diagram
+## 5. Preemption and Interrupts in the Context of Processes
+
+Understanding how processes are interrupted and preempted is essential to understanding why certain data structures (like `thread_info.flags` and `preempt_count`) exist and how they interact with the scheduler.
+
+### 5.1 Interrupts and the Kernel Entry/Exit Path
+
+When a hardware interrupt fires, the CPU immediately saves a minimal register frame and jumps to the corresponding interrupt handler. In the Linux kernel, interrupt handlers run in the context of whatever task happened to be executing at the time — they do not have their own `task_struct` or kernel stack (on x86_64, the CPU switches to a per-CPU interrupt stack via the IST or `irq_stack_union`, but the "current" task remains unchanged).
+
+Upon return from an interrupt, the kernel checks the interrupted task's `thread_info.flags` for work that needs to be done before resuming. The key flags checked at this point are:
+
+- `TIF_NEED_RESCHED` — If set, the scheduler should run. If the interrupt occurred while the task was in kernel mode and preemption is enabled (i.e., `preempt_count == 0`), the kernel calls `preempt_schedule_irq()` to perform a preemptive context switch. If the interrupt occurred while in user mode, the scheduler runs via `exit_to_user_mode_loop()`.
+- `TIF_SIGPENDING` — If set, signal delivery is needed before returning to user mode.
+- `TIF_NOTIFY_RESUME` — If set, various callbacks (uprobes, rseq, task_work) must run before returning to user mode.
+
+This is why `thread_info.flags` is so performance-critical: it is checked on every single return from interrupt, exception, and syscall. The flags are designed to fit in a single cache line, and on x86 the `TIF_NEED_RESCHED` check is further optimized by mirroring it in the per-CPU `preempt_count` (see Section 1.1).
+
+### 5.2 preempt_count — The Preemption Guard
+
+The `preempt_count` is a 32-bit integer that encodes multiple nesting depths in a single value (`include/linux/preempt.h`):
+
+```
+Bit layout:
+  bits  0- 7: PREEMPT_MASK  (0x000000ff) — preempt_disable() nesting depth
+  bits  8-15: SOFTIRQ_MASK  (0x0000ff00) — softirq disable depth
+  bits 16-19: HARDIRQ_MASK  (0x000f0000) — hard IRQ nesting depth
+  bits 20-23: NMI_MASK      (0x00f00000) — NMI nesting depth
+  bit     31: PREEMPT_NEED_RESCHED (x86 only, inverted)
+```
+
+A task is preemptible only when the entire `preempt_count` is zero (meaning no preemption disabling, no softirq processing, no hardirq handling, and no NMI). The kernel provides context-testing macros derived from this:
+
+- `in_task()` — True if not in any interrupt context (hardirq, softirq, or NMI).
+- `in_hardirq()` — True if executing in a hardware interrupt handler.
+- `in_softirq()` — True if softirqs are disabled (includes BH-disabled sections).
+- `in_atomic()` — True if preemption is disabled for any reason.
+
+When kernel code calls `preempt_disable()`, it increments the preempt nesting count (bits 0–7). When it calls `preempt_enable()`, it decrements. If the decrement brings the count to zero and `TIF_NEED_RESCHED` is set, the kernel immediately calls `preempt_schedule()` to invoke the scheduler.
+
+On x86_64, `preempt_count` is a per-CPU variable (not stored in `thread_info`), accessed via `%gs:`-relative addressing. The `preempt_enable()` path compiles down to a single `decl %gs:__preempt_count` instruction, and the CPU's zero flag (`ZF`) simultaneously tests both the preempt nesting depth and the inverted `PREEMPT_NEED_RESCHED` bit (bit 31). This is one of the most heavily optimized paths in the kernel.
+
+### 5.3 How Preemption Actually Happens
+
+Preemption can occur at two distinct points:
+
+**Kernel preemption from `preempt_enable()`:** When a task calls `preempt_enable()` and the decrement hits zero with `TIF_NEED_RESCHED` set, `preempt_schedule()` (`core.c:7033`) is called. This function verifies the task is preemptible (not in an interrupt, `preempt_count == 0`), then calls `__schedule(SM_PREEMPT)`. The `SM_PREEMPT` mode tells the scheduler this is an involuntary preemption, which affects how the outgoing task's state is recorded in the `sched:sched_switch` tracepoint (it appears as `R+` rather than `S` or `D`).
+
+**Kernel preemption from interrupt return:** When an interrupt handler finishes and is about to return to kernel mode, `preempt_schedule_irq()` (`core.c:7079`) is called if `TIF_NEED_RESCHED` is set and `preempt_count == 0`. This function re-enables interrupts (since they were disabled by the interrupt return path), calls `__schedule(SM_PREEMPT)`, then disables interrupts again before returning. It loops in case another preemption request arrives during the schedule.
+
+**User-mode return:** When returning from a syscall or interrupt to user mode, `exit_to_user_mode_loop()` checks `TIF_NEED_RESCHED` and calls `schedule()` if set. This is not technically "preemption" (it occurs at a natural boundary), but it ensures that the scheduler runs before the task resumes in user space.
+
+### 5.4 Preemption Models
+
+Linux 6.19 supports multiple preemption models, selectable at build time or dynamically at boot (via `CONFIG_PREEMPT_DYNAMIC`):
+
+| Model | `preempt_schedule()` | `cond_resched()` | Characteristics |
+|-------|---------------------|-----------------|-----------------|
+| PREEMPT_NONE | Disabled (NOP) | Active | Maximum throughput, no kernel preemption. Tasks yield only at explicit `cond_resched()` or syscall/interrupt return. |
+| PREEMPT_VOLUNTARY | Disabled (NOP) | Active | Same as NONE but with more `cond_resched()` points in long-running kernel paths. Traditional server default. |
+| PREEMPT (Full) | Active | Returns 0 (NOP) | Any kernel code is preemptible unless preemption is explicitly disabled. Low latency for desktop/interactive use. |
+| PREEMPT_LAZY | Active (lazy flag) | Returns 0 (NOP) | New in 6.x. Uses `TIF_NEED_RESCHED_LAZY` to defer preemption to natural scheduling points, but still allows urgent preemption via `TIF_NEED_RESCHED`. Balances latency and throughput. |
+| PREEMPT_RT | Active | Active | Hard real-time. Most spinlocks become sleeping locks, allowing preemption even in critical sections. |
+
+The choice of preemption model affects how aggressively the scheduler can interrupt running kernel code, which in turn affects the latency experienced by processes waiting to be scheduled.
+
+```mermaid
+graph TB
+    subgraph "Preemption check points"
+        direction TB
+        A["Timer interrupt fires<br/>scheduler_tick() sets TIF_NEED_RESCHED"]
+        B{"Returning to<br/>kernel or user?"}
+        C{"preempt_count == 0?"}
+        D["preempt_schedule_irq()<br/>-> __schedule(SM_PREEMPT)"]
+        E["Resume kernel code<br/>(preemption deferred)"]
+        F["exit_to_user_mode_loop()<br/>-> schedule()"]
+        G["preempt_enable() called"]
+        H{"preempt_count<br/>decrements to 0?"}
+        I["preempt_schedule()<br/>-> __schedule(SM_PREEMPT)"]
+        J["Continue execution"]
+    end
+
+    A --> B
+    B -->|"kernel mode"| C
+    B -->|"user mode"| F
+    C -->|"yes"| D
+    C -->|"no"| E
+    G --> H
+    H -->|"yes + TIF_NEED_RESCHED"| I
+    H -->|"no"| J
+
+    style D fill:#fce4ec
+    style F fill:#fce4ec
+    style I fill:#fce4ec
+```
+
+---
+
+## 6. Integrated Lifecycle Diagram
 
 The following diagram brings together all phases of a process's life — from creation through scheduling and context switching to final destruction. The blue-highlighted nodes indicate points where the scheduler is directly involved.
 
@@ -805,7 +1030,7 @@ graph TB
 
 ---
 
-## 6. Function Quick Reference
+## 7. Function Quick Reference
 
 | Function | File:Line | Role |
 |----------|-----------|------|
@@ -832,16 +1057,18 @@ graph TB
 | `free_task()` | `kernel/fork.c:528` | Free task_struct memory |
 | `complete_signal()` | `kernel/signal.c:963` | Signal delivery completion |
 | `get_signal()` | `kernel/signal.c:2799` | Dequeue and process signals |
+| `preempt_schedule()` | `kernel/sched/core.c:7033` | Preemption from preempt_enable() |
+| `preempt_schedule_irq()` | `kernel/sched/core.c:7079` | Preemption from interrupt return |
 
 ---
 
-## 7. Observing the Process Lifecycle with trace-cmd (ftrace)
+## 8. Observing the Process Lifecycle with trace-cmd (ftrace)
 
 The Linux kernel embeds tracepoints at every major point in the process lifecycle. These tracepoints are compiled into the kernel and can be dynamically enabled at runtime via ftrace. The `trace-cmd` tool provides a convenient command-line interface for recording and analyzing these traces without manually writing to `/sys/kernel/debug/tracing/` files.
 
 The tracepoints discussed in this section correspond directly to the code paths described in the preceding chapters. Each one fires at a specific point in the kernel source, and together they allow an observer to reconstruct the complete birth-to-death timeline of any process.
 
-### 7.1 Tracepoint Map
+### 8.1 Tracepoint Map
 
 The following table lists every tracepoint relevant to the process lifecycle, where it fires in the source code, and what fields it exports. The "Lifecycle phase" column maps each tracepoint to the corresponding section in this document.
 
@@ -861,7 +1088,7 @@ The following table lists every tracepoint relevant to the process lifecycle, wh
 | `signal:signal_generate` | `kernel/signal.c:1155, 2083` | `__send_signal_locked()` — a signal is queued to a task | `sig`, `errno`, `code`, `comm`, `pid`, `group`, `result` | Signal death (4.1) |
 | `signal:signal_deliver` | `kernel/signal.c:2870, 2929` | `get_signal()` — a signal is dequeued and about to be handled | `sig`, `errno`, `code`, `sa_handler`, `sa_flags` | Signal death (4.1) |
 
-### 7.2 Recording Traces
+### 8.2 Recording Traces
 
 All commands below require root privileges. `trace-cmd` wraps ftrace; the `record` subcommand enables the specified tracepoints, runs the workload (or records system-wide), and writes a binary `trace.dat` file. The `report` subcommand reads `trace.dat` and prints human-readable output.
 
@@ -999,7 +1226,7 @@ trace-cmd report
 
 Each event shows `orig_cpu` and `dest_cpu`, allowing you to track how the scheduler distributes work across cores.
 
-### 7.3 Filtering Traces
+### 8.3 Filtering Traces
 
 `trace-cmd` supports per-event filters using the ftrace filter syntax. This is useful when the system is busy and you only want events related to a specific process or condition.
 
@@ -1020,7 +1247,7 @@ sudo trace-cmd record -e signal:signal_generate \
     sleep 10
 ```
 
-### 7.4 Using trace-cmd with function tracing
+### 8.4 Using trace-cmd with function tracing
 
 Beyond tracepoints, `trace-cmd` can also record function calls. This is useful for tracing the internal call chain of functions described in this document:
 
@@ -1054,7 +1281,7 @@ sudo trace-cmd record -p function_graph \
 trace-cmd report -i switch_trace.dat
 ```
 
-### 7.5 Lifecycle Event Ordering
+### 8.5 Lifecycle Event Ordering
 
 When all tracepoints are enabled simultaneously, the events for a single process's life appear in the following order. This sequence maps directly to the code paths described throughout this document:
 
