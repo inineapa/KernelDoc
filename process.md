@@ -154,9 +154,9 @@ After resource copying, the scheduler is initialized via `sched_fork()`. This se
 
 Then `copy_thread()` (`arch/x86/kernel/process.c:170`) sets up the architecture-specific register frame. On x86_64, it copies the parent's `pt_regs` into the child's kernel stack, sets `childregs->ax = 0` (so that fork returns 0 in the child), stores the child's stack pointer, copies the I/O permission bitmap, and configures `ret_from_fork_asm` as the entry point for when the child is first scheduled.
 
-Finally, `alloc_pid()` assigns a PID, and control returns to `kernel_clone()`, which calls `wake_up_new_task()` to insert the child into the scheduler's runqueue. This sets the child's state to `TASK_RUNNING`, calls `enqueue_task()` to place it in the CFS red-black tree, and invokes `check_preempt_curr()` to determine whether the new child should preempt the currently running task.
+Finally, `alloc_pid()` assigns a PID. At this point, near the end of `copy_process()`, the tracepoint `task:task_newtask` fires (`fork.c:2468`), recording the new task's PID, comm, and clone flags. Control then returns to `kernel_clone()`, which fires `sched:sched_process_fork` (`fork.c:2661`) — recording the parent-child PID pair — and then calls `wake_up_new_task()` to insert the child into the scheduler's runqueue. Inside `wake_up_new_task()`, the tracepoint `sched:sched_wakeup_new` fires (`core.c:4759`) as the child is placed on a runqueue for the first time. This sets the child's state to `TASK_RUNNING`, calls `enqueue_task()` to place it in the CFS red-black tree, and invokes `check_preempt_curr()` to determine whether the new child should preempt the currently running task.
 
-The parent receives the child's PID as the return value of `fork()`. The child, when eventually picked by the scheduler, begins execution at `ret_from_fork_asm`, calls `finish_task_switch()` to complete the context switch bookkeeping, then returns to user space with a return value of 0.
+The parent receives the child's PID as the return value of `fork()`. The child, when eventually picked by the scheduler, begins execution at `ret_from_fork_asm`, calls `finish_task_switch()` to complete the context switch bookkeeping, then returns to user space with a return value of 0. The context switch itself is recorded by the `sched:sched_switch` tracepoint.
 
 #### Key Code Points
 
@@ -314,7 +314,7 @@ Regardless of the trigger, the core function is `__schedule()` (`core.c:6722`). 
 
 Next, `pick_next_task()` iterates through the scheduling classes in priority order and selects the next task to run. For the common case where only CFS tasks are present, `pick_next_task_fair()` selects the `sched_entity` with the smallest `vruntime` from the red-black tree.
 
-If the selected task is different from the currently running task, a context switch is necessary. `context_switch()` (`core.c:5201`) performs this in three stages:
+If the selected task is different from the currently running task, a context switch is necessary. At this point, immediately before calling `context_switch()`, the tracepoint `sched:sched_switch` fires (`core.c:6864`), recording the outgoing task's comm, PID, priority, and state, as well as the incoming task's comm, PID, and priority. The `prev_state` field encodes whether the outgoing task was preempted (`R+`) or voluntarily yielded (`S` for interruptible sleep, `D` for uninterruptible, `Z` for zombie, `X` for dead, etc.). This is one of the most important tracepoints for understanding scheduler behavior. `context_switch()` (`core.c:5201`) then performs the switch in three stages:
 
 **Stage 1 — Preparation:** `prepare_task_switch()` fires perf events for the scheduling-out task and marks the incoming task as on-CPU.
 
@@ -396,7 +396,7 @@ sequenceDiagram
 
 ### 3.2 Summary of Scheduler Intervention Points
 
-The scheduler intervenes at specific, well-defined points throughout a process's lifetime. During process creation, `sched_fork()` initializes the scheduling parameters and `wake_up_new_task()` enqueues the new task. During normal execution, voluntary scheduling occurs when a task calls `schedule()`, `cond_resched()`, or blocks on a mutex or wait queue. Involuntary preemption is triggered by the timer interrupt (`scheduler_tick()` sets `TIF_NEED_RESCHED`), checked at interrupt return (`preempt_schedule_irq()`), at syscall return (`exit_to_user_mode_loop()`), and when a higher-priority task is woken up (`try_to_wake_up()` calls `check_preempt_curr()`). At process death, `do_task_dead()` performs the final involuntary scheduling call, after which `finish_task_switch()` handles the dead task's cleanup.
+The scheduler intervenes at specific, well-defined points throughout a process's lifetime. During process creation, `sched_fork()` initializes the scheduling parameters and `wake_up_new_task()` enqueues the new task. During normal execution, voluntary scheduling occurs when a task calls `schedule()`, `cond_resched()`, or blocks on a mutex or wait queue. Involuntary preemption is triggered by the timer interrupt (`scheduler_tick()` sets `TIF_NEED_RESCHED`), checked at interrupt return (`preempt_schedule_irq()`), at syscall return (`exit_to_user_mode_loop()`), and when a higher-priority task is woken up (`try_to_wake_up()` calls `check_preempt_curr()`). The wakeup path fires two tracepoints: `sched:sched_waking` (`core.c:4095/4111`) from the waking CPU's context before the state change, and `sched:sched_wakeup` (`core.c:3607`) immediately after the target's state is set to `TASK_RUNNING`. If a task is migrated between CPUs, `sched:sched_migrate_task` fires (`core.c:3259`). At process death, `do_task_dead()` performs the final involuntary scheduling call, after which `finish_task_switch()` handles the dead task's cleanup.
 
 ```mermaid
 graph TB
@@ -468,7 +468,7 @@ A process can terminate in two fundamentally different ways: by voluntarily call
 
 Each woken thread, upon returning from its current syscall or interrupt, enters the signal processing path. The function `get_signal()` (`signal.c:2799`) is called from the architecture-specific return-to-user-mode code. When `get_signal()` sees that `SIGNAL_GROUP_EXIT` is already set, it jumps directly to the fatal exit path, sets `PF_SIGNALED` on the task, and calls `do_group_exit(signr)`. For core-dumping signals (e.g., `SIGSEGV`, `SIGABRT`), `get_signal()` first calls `vfs_coredump()` to write the core dump, then proceeds to `do_group_exit()`.
 
-The complete signal-to-death chain is: signal sent -> `__send_signal_locked()` -> `complete_signal()` (wakes all threads, sets `SIGNAL_GROUP_EXIT`) -> each thread returns to user mode -> `get_signal()` -> `do_group_exit()` -> `do_exit()` -> `do_task_dead()` -> `__schedule()` -> never returns.
+The complete signal-to-death chain is: signal sent -> `__send_signal_locked()` -> `complete_signal()` (wakes all threads, sets `SIGNAL_GROUP_EXIT`) -> each thread returns to user mode -> `get_signal()` -> `do_group_exit()` -> `do_exit()` -> `do_task_dead()` -> `__schedule()` -> never returns. The tracepoint `signal:signal_generate` fires inside `__send_signal_locked()` (`signal.c:1155`) when the signal is queued, recording the signal number, target task, and delivery result. Later, `signal:signal_deliver` fires inside `get_signal()` (`signal.c:2870/2929`) when the signal is actually dequeued and about to be handled.
 
 ```mermaid
 sequenceDiagram
@@ -513,7 +513,7 @@ The function `do_exit()` (`exit.c:896`) is the central teardown routine for a dy
 
 The function proceeds through several phases of cleanup, executed in a carefully ordered sequence:
 
-**Phase 1 — Early cleanup:** `synchronize_group_exit()` sets `SIGNAL_GROUP_EXIT` and handles coredump serialization. Then `exit_signals()` sets the `PF_EXITING` flag on the current task, which serves as a signal to other parts of the kernel that this task is in the process of dying and should not receive further signals. `ptrace_event(PTRACE_EVENT_EXIT)` notifies any attached debugger, and `io_uring_files_cancel()` cancels outstanding asynchronous I/O operations.
+**Phase 1 — Early cleanup:** `synchronize_group_exit()` sets `SIGNAL_GROUP_EXIT` and handles coredump serialization. Then `exit_signals()` sets the `PF_EXITING` flag on the current task, which serves as a signal to other parts of the kernel that this task is in the process of dying and should not receive further signals. `ptrace_event(PTRACE_EVENT_EXIT)` notifies any attached debugger, and `io_uring_files_cancel()` cancels outstanding asynchronous I/O operations. After the exit code is stored, the tracepoint `sched:sched_process_exit` fires (`exit.c:942`), recording the dying task's comm, PID, priority, and whether this is the last thread in the group (`group_dead`).
 
 **Phase 2 — Resource release:** This is the bulk of the function. Resources are released in a specific order that avoids use-after-free and lock ordering problems:
 
@@ -559,7 +559,7 @@ Therefore, the cleanup of the dead task's stack and `task_struct` is delegated t
 
 1. Calls `prev->sched_class->task_dead(prev)` for scheduling-class-specific cleanup.
 2. Calls `put_task_stack(prev)` to release the kernel stack memory.
-3. Calls `put_task_struct_rcu_user(prev)` to drop the RCU user reference, which schedules `delayed_put_task_struct()` to run after an RCU grace period.
+3. Calls `put_task_struct_rcu_user(prev)` to drop the RCU user reference, which schedules `delayed_put_task_struct()` to run after an RCU grace period. Inside that RCU callback, the tracepoint `sched:sched_process_free` fires (`exit.c:230`) — this is the very last moment the `task_struct` is valid before `put_task_struct()` frees it.
 
 This is why `do_task_dead()` ends with `do_exit()` calling `__schedule()` as its final act — it is not merely "finishing with a schedule call" but rather the only possible mechanism for the task to hand off its own physical resources to another entity that can safely free them.
 
@@ -698,7 +698,7 @@ Why mm is released first:
 
 When a process finishes `do_exit()`, it does not simply vanish. Its `task_struct` lingers in one of two states: `EXIT_ZOMBIE` or `EXIT_DEAD`.
 
-A zombie is a process that has released all of its resources (memory, files, etc.) but whose `task_struct` still exists because the parent has not yet called `wait()` to collect the exit status. The zombie is extremely lightweight — it holds only the `task_struct` shell with the exit code. Once the parent calls `wait()` (which internally calls `do_wait()` -> `wait_task_zombie()`), `release_task()` is invoked, which unhashes the process from all PID tables, removes its `/proc` entry, and schedules the final RCU-deferred `free_task()`.
+A zombie is a process that has released all of its resources (memory, files, etc.) but whose `task_struct` still exists because the parent has not yet called `wait()` to collect the exit status. The zombie is extremely lightweight — it holds only the `task_struct` shell with the exit code. Once the parent calls `wait()`, the tracepoint `sched:sched_process_wait` fires at the entry of `do_wait()` (`exit.c:1708`), recording the waiting parent and the target PID. Internally, `do_wait()` calls `wait_task_zombie()`, then `release_task()` is invoked, which unhashes the process from all PID tables, removes its `/proc` entry, and schedules the final RCU-deferred `free_task()`.
 
 In the autoreap path, the zombie state is skipped entirely. If the parent has set `SA_NOCLDWAIT` or has `SIGCHLD` set to `SIG_IGN`, `exit_notify()` sets the exit state directly to `EXIT_DEAD` and calls `release_task()` immediately.
 
@@ -832,3 +832,254 @@ graph TB
 | `free_task()` | `kernel/fork.c:528` | Free task_struct memory |
 | `complete_signal()` | `kernel/signal.c:963` | Signal delivery completion |
 | `get_signal()` | `kernel/signal.c:2799` | Dequeue and process signals |
+
+---
+
+## 7. Observing the Process Lifecycle with trace-cmd (ftrace)
+
+The Linux kernel embeds tracepoints at every major point in the process lifecycle. These tracepoints are compiled into the kernel and can be dynamically enabled at runtime via ftrace. The `trace-cmd` tool provides a convenient command-line interface for recording and analyzing these traces without manually writing to `/sys/kernel/debug/tracing/` files.
+
+The tracepoints discussed in this section correspond directly to the code paths described in the preceding chapters. Each one fires at a specific point in the kernel source, and together they allow an observer to reconstruct the complete birth-to-death timeline of any process.
+
+### 7.1 Tracepoint Map
+
+The following table lists every tracepoint relevant to the process lifecycle, where it fires in the source code, and what fields it exports. The "Lifecycle phase" column maps each tracepoint to the corresponding section in this document.
+
+| Tracepoint | Source location | Fires when | Exported fields | Lifecycle phase |
+|------------|----------------|------------|-----------------|-----------------|
+| `task:task_newtask` | `kernel/fork.c:2468` | `copy_process()` completes — new task_struct is fully initialized but not yet runnable | `pid`, `comm`, `clone_flags`, `oom_score_adj` | Creation (2.1) |
+| `sched:sched_process_fork` | `kernel/fork.c:2661` | `kernel_clone()` records the parent-child relationship, just before waking the child | `parent_comm`, `parent_pid`, `child_comm`, `child_pid` | Creation (2.1) |
+| `sched:sched_wakeup_new` | `kernel/sched/core.c:4759` | `wake_up_new_task()` places the newly forked child on a runqueue for the first time | `comm`, `pid`, `prio`, `target_cpu` | Creation (2.1) |
+| `sched:sched_waking` | `kernel/sched/core.c:4095, 4111` | `try_to_wake_up()` makes the wakeup decision, from the waking CPU's context | `comm`, `pid`, `prio`, `target_cpu` | Scheduling (3.2) |
+| `sched:sched_wakeup` | `kernel/sched/core.c:3607` | `ttwu_do_wakeup()` sets `p->__state = TASK_RUNNING` | `comm`, `pid`, `prio`, `target_cpu` | Scheduling (3.2) |
+| `sched:sched_switch` | `kernel/sched/core.c:6864` | `__schedule()`, immediately before `context_switch()` — the actual CPU handover | `prev_comm`, `prev_pid`, `prev_prio`, `prev_state`, `next_comm`, `next_pid`, `next_prio` | Context switch (3.1) |
+| `sched:sched_migrate_task` | `kernel/sched/core.c:3259` | `set_task_cpu()` — a task is about to be moved to a different CPU | `comm`, `pid`, `prio`, `orig_cpu`, `dest_cpu` | Scheduling (3.2) |
+| `sched:sched_stat_runtime` | `kernel/sched/fair.c:1159` | `update_curr()` — CFS accounts CPU time each tick (requires `CONFIG_SCHEDSTATS`) | `comm`, `pid`, `runtime` (ns) | Scheduling (3.1) |
+| `sched:sched_process_exit` | `kernel/exit.c:942` | `do_exit()` — the task is dying, exit_code is set | `comm`, `pid`, `prio`, `group_dead` | Destruction (4.2) |
+| `sched:sched_process_wait` | `kernel/exit.c:1708` | `do_wait()` — the parent enters `wait4()`/`waitpid()` | `comm` (waiter), `pid` (waited), `prio` | Destruction (4.7) |
+| `sched:sched_process_free` | `kernel/exit.c:230` | `delayed_put_task_struct()` — RCU callback, last moment before `task_struct` is freed | `comm`, `pid`, `prio` | Destruction (4.3) |
+| `signal:signal_generate` | `kernel/signal.c:1155, 2083` | `__send_signal_locked()` — a signal is queued to a task | `sig`, `errno`, `code`, `comm`, `pid`, `group`, `result` | Signal death (4.1) |
+| `signal:signal_deliver` | `kernel/signal.c:2870, 2929` | `get_signal()` — a signal is dequeued and about to be handled | `sig`, `errno`, `code`, `sa_handler`, `sa_flags` | Signal death (4.1) |
+
+### 7.2 Recording Traces
+
+All commands below require root privileges. `trace-cmd` wraps ftrace; the `record` subcommand enables the specified tracepoints, runs the workload (or records system-wide), and writes a binary `trace.dat` file. The `report` subcommand reads `trace.dat` and prints human-readable output.
+
+#### Full lifecycle of a specific command
+
+To trace the complete lifecycle of a process — from fork through scheduling to exit — recording all relevant tracepoints while running a command:
+
+```bash
+# Record all lifecycle tracepoints for a specific command
+sudo trace-cmd record -e task:task_newtask \
+                      -e sched:sched_process_fork \
+                      -e sched:sched_wakeup_new \
+                      -e sched:sched_waking \
+                      -e sched:sched_wakeup \
+                      -e sched:sched_switch \
+                      -e sched:sched_process_exit \
+                      -e sched:sched_process_wait \
+                      -e sched:sched_process_free \
+                      -e signal:signal_generate \
+                      -e signal:signal_deliver \
+                      -- ls /tmp
+
+# View the trace
+trace-cmd report
+```
+
+The output will show events in chronological order across all CPUs. A typical fork+exec+exit sequence looks like:
+
+```
+bash-1234  [002]  100.001: task:task_newtask:        pid=5678 comm=bash clone_flags=0x1200000
+bash-1234  [002]  100.001: sched:sched_process_fork: comm=bash pid=1234 child_comm=bash child_pid=5678
+bash-1234  [002]  100.001: sched:sched_wakeup_new:   comm=bash pid=5678 prio=120 target_cpu=003
+   ...     [003]  100.002: sched:sched_switch:        prev_comm=idle prev_pid=0 ... ==> next_comm=bash next_pid=5678
+bash-5678  [003]  100.003: sched:sched_process_exit:  comm=ls pid=5678 prio=120
+   ...     [003]  100.004: sched:sched_process_free:  comm=ls pid=5678 prio=120
+```
+
+#### Tracing context switches only
+
+Context switches are recorded by `sched:sched_switch`, the single most informative tracepoint for understanding scheduler behavior. The `prev_state` field reveals why the outgoing task was descheduled:
+
+```bash
+# Record only context switches for 5 seconds
+sudo trace-cmd record -e sched:sched_switch sleep 5
+
+# Report, filtering for a specific process
+trace-cmd report | grep "my_process"
+```
+
+The `prev_state` values in the output are encoded as:
+
+| Symbol | Meaning | Corresponding kernel state |
+|--------|---------|---------------------------|
+| `R` | Running (preempted) | `TASK_RUNNING` |
+| `R+` | Running, preempted | `TASK_RUNNING` + preempt flag |
+| `S` | Interruptible sleep | `TASK_INTERRUPTIBLE` |
+| `D` | Uninterruptible sleep | `TASK_UNINTERRUPTIBLE` |
+| `T` | Stopped | `__TASK_STOPPED` |
+| `t` | Traced | `__TASK_TRACED` |
+| `X` | Dead | `TASK_DEAD` / `EXIT_DEAD` |
+| `Z` | Zombie | `EXIT_ZOMBIE` |
+| `I` | Idle | `TASK_IDLE` |
+
+#### Tracing wakeups and wakeup latency
+
+The `sched_waking` -> `sched_wakeup` -> `sched_switch` sequence reveals the latency between a task being woken and actually getting CPU time:
+
+```bash
+# Record wakeups and switches together
+sudo trace-cmd record -e sched:sched_waking \
+                      -e sched:sched_wakeup \
+                      -e sched:sched_switch \
+                      sleep 5
+
+trace-cmd report
+```
+
+To measure wakeup latency, look for the timestamp delta between `sched_waking` (wakeup initiated) and the `sched_switch` where the task appears as `next_comm`.
+
+#### Tracing signal delivery and signal-caused death
+
+To observe the full signal path — from generation through delivery to process exit:
+
+```bash
+# Record signal + exit tracepoints while sending a signal
+sudo trace-cmd record -e signal:signal_generate \
+                      -e signal:signal_deliver \
+                      -e sched:sched_process_exit \
+                      -e sched:sched_process_free &
+TRACE_PID=$!
+
+# In another terminal, run a process and kill it
+sleep 100 &
+TARGET=$!
+kill -TERM $TARGET
+
+sudo kill -INT $TRACE_PID   # stop trace-cmd
+wait $TRACE_PID
+trace-cmd report
+```
+
+The output will show:
+1. `signal_generate` — `SIGTERM` queued to the target (with `result=0` meaning `TRACE_SIGNAL_DELIVERED`)
+2. `signal_deliver` — `SIGTERM` dequeued inside `get_signal()`, `sa_handler=0` (SIG_DFL)
+3. `sched_process_exit` — `do_exit()` called
+4. `sched_process_free` — `task_struct` freed after RCU grace period
+
+#### Tracing process creation and destruction together
+
+To see the complete birth-to-death cycle including the parent's `wait()`:
+
+```bash
+# Trace fork + exit + wait
+sudo trace-cmd record -e task:task_newtask \
+                      -e sched:sched_process_fork \
+                      -e sched:sched_wakeup_new \
+                      -e sched:sched_process_exit \
+                      -e sched:sched_process_wait \
+                      -e sched:sched_process_free \
+                      -- bash -c 'sleep 0.1'
+
+trace-cmd report
+```
+
+#### Tracing CPU migration
+
+When the scheduler moves a task between CPUs (for load balancing or NUMA optimization), the `sched_migrate_task` tracepoint fires:
+
+```bash
+# Record migration events for 10 seconds
+sudo trace-cmd record -e sched:sched_migrate_task sleep 10
+
+trace-cmd report
+```
+
+Each event shows `orig_cpu` and `dest_cpu`, allowing you to track how the scheduler distributes work across cores.
+
+### 7.3 Filtering Traces
+
+`trace-cmd` supports per-event filters using the ftrace filter syntax. This is useful when the system is busy and you only want events related to a specific process or condition.
+
+```bash
+# Only record context switches involving PID 1234
+sudo trace-cmd record -e sched:sched_switch \
+    -f 'prev_pid == 1234 || next_pid == 1234' \
+    sleep 5
+
+# Only record forks where the parent is bash
+sudo trace-cmd record -e sched:sched_process_fork \
+    -f 'parent_comm == "bash"' \
+    sleep 5
+
+# Only record SIGKILL signals
+sudo trace-cmd record -e signal:signal_generate \
+    -f 'sig == 9' \
+    sleep 10
+```
+
+### 7.4 Using trace-cmd with function tracing
+
+Beyond tracepoints, `trace-cmd` can also record function calls. This is useful for tracing the internal call chain of functions described in this document:
+
+```bash
+# Trace function calls in the fork path
+sudo trace-cmd record -p function_graph \
+    -g kernel_clone \
+    -- ls /tmp
+
+trace-cmd report
+```
+
+This produces a hierarchical call graph showing the exact execution path through `kernel_clone()` -> `copy_process()` -> `dup_task_struct()` -> etc., with timestamps for each function entry and exit.
+
+```bash
+# Trace the exit path
+sudo trace-cmd record -p function_graph \
+    -g do_group_exit \
+    -- bash -c 'exit 0'
+
+trace-cmd report
+```
+
+```bash
+# Trace the context switch path
+sudo trace-cmd record -p function_graph \
+    -g __schedule \
+    -o switch_trace.dat \
+    sleep 1
+
+trace-cmd report -i switch_trace.dat
+```
+
+### 7.5 Lifecycle Event Ordering
+
+When all tracepoints are enabled simultaneously, the events for a single process's life appear in the following order. This sequence maps directly to the code paths described throughout this document:
+
+```
+Birth:
+  1. task:task_newtask          fork.c:2468    copy_process() — struct allocated
+  2. sched:sched_process_fork   fork.c:2661    kernel_clone() — parent/child recorded
+  3. sched:sched_wakeup_new     core.c:4759    wake_up_new_task() — first enqueue
+
+Life (repeating):
+  4. sched:sched_waking         core.c:4095    try_to_wake_up() — wakeup initiated
+  5. sched:sched_wakeup         core.c:3607    ttwu_do_wakeup() — state = RUNNING
+  6. sched:sched_switch         core.c:6864    __schedule() — context switch
+  7. sched:sched_migrate_task   core.c:3259    set_task_cpu() — CPU migration
+  8. sched:sched_stat_runtime   fair.c:1159    update_curr() — runtime accounting
+
+Signals (if any):
+  9. signal:signal_generate     signal.c:1155  __send_signal_locked() — signal queued
+ 10. signal:signal_deliver      signal.c:2929  get_signal() — signal dequeued
+
+Death:
+ 11. sched:sched_process_exit   exit.c:942     do_exit() — task dying
+ 12. sched:sched_switch         core.c:6864    __schedule() — final switch (prev_state=X)
+ 13. sched:sched_process_wait   exit.c:1708    do_wait() — parent waits
+ 14. sched:sched_process_free   exit.c:230     delayed_put_task_struct() — struct freed
+```
+
+Note that event 12 (the final `sched_switch`) will show `prev_state=X` (dead) for the dying task, and the `next_comm`/`next_pid` will be whatever task the scheduler picks to run next. This is the last `sched_switch` event where the dying task appears as `prev`.
