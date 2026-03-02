@@ -4,11 +4,21 @@
 
 ---
 
+## Before You Begin
+
+In user space, memory management is simple: you call `malloc()`, use the memory, and call `free()`. Behind the scenes, the kernel handles virtual-to-physical translation, demand paging, copy-on-write, swapping, and reclaim. If you have ever wondered why `fork()` is fast even though it "copies" the entire address space, or what actually happens when a process touches memory it has `mmap()`'d but never read, this document provides the answers.
+
+We start with the data structures the kernel uses to track virtual and physical memory, then trace the key operations: `mmap()`, page faults, physical page allocation, and memory reclaim. If you are coming from user-space development, the key shift in perspective is this: `malloc()` does not allocate physical memory — it just reserves virtual addresses. Physical memory is allocated one page at a time, lazily, when the process actually touches each page.
+
+---
+
 ## 1. Core Data Structures
 
 The memory management subsystem revolves around three central data structures: `mm_struct` (which describes a process's entire virtual address space), `vm_area_struct` (which describes one contiguous region within that address space), and `struct page` / `struct folio` (which describe physical memory). All three are defined in `include/linux/mm_types.h`. Understanding their fields and relationships is the foundation for understanding everything else in this chapter.
 
 ### 1.1 mm_struct — The Process Address Space Descriptor
+
+In user space, you think of your process as having "memory." In the kernel, that memory is described by an `mm_struct` — one per process. It tracks the page table root (the hardware mapping from virtual to physical addresses), all the VMAs (virtual memory areas — the regions you see in `/proc/[pid]/maps`), and accounting data like how much memory is locked, mapped, or used.
 
 Every user-space process has exactly one `mm_struct` (`include/linux/mm_types.h:1075`), pointed to by `task_struct.mm`. Kernel threads have `mm == NULL` and instead borrow an `active_mm` from the previous user process (lazy TLB mode). The `mm_struct` holds everything the kernel needs to manage a process's virtual memory: the page table root, the VMA collection, memory accounting counters, and layout bounds.
 
@@ -42,6 +52,8 @@ The most important fields:
 The `mm_struct` has a two-level reference counting scheme. `mm_users` counts the number of `task_struct`s actively using this address space (each thread in a process holds one). When the last user exits, `__mmput()` tears down all VMAs, frees all page tables, and decrements `mm_count`. The `mm_count` field is incremented by kernel threads that borrow the mm as `active_mm` (to avoid TLB flushes). Only when `mm_count` drops to zero is the `mm_struct` itself freed via `mmdrop()`.
 
 ### 1.2 vm_area_struct (VMA) — A Contiguous Virtual Region
+
+If you have ever looked at `/proc/self/maps`, each line in that output corresponds to one VMA in the kernel. A VMA is the kernel's way of saying "addresses X through Y belong to this process, with these permissions, backed by this file (or nothing, for anonymous memory)."
 
 A `vm_area_struct` (`include/linux/mm_types.h:904`) represents a single contiguous range of virtual addresses with uniform permissions and backing. When a process calls `mmap()`, one VMA is created. The heap is one VMA. Each shared library's text, data, and BSS segments are separate VMAs. A typical process has tens to hundreds of VMAs.
 
@@ -85,6 +97,8 @@ The `vm_operations_struct` (`include/linux/mm.h:744`) provides hooks:
 All VMAs in an `mm_struct` are stored in a **maple tree** (`mm->mm_mt`), a B-tree variant optimized for ranges. This replaces the red-black tree used in older kernels. The maple tree provides `O(log N)` lookup, insertion, and removal, and its cache-friendly node layout significantly reduces the number of cache misses during VMA walks compared to the RB-tree.
 
 ### 1.3 struct page and struct folio — Physical Memory Descriptors
+
+While `mm_struct` and VMAs describe *virtual* memory, `struct page` describes *physical* memory — the actual RAM chips. Every 4KB frame of physical memory in the system has a corresponding `struct page`, whether that frame is currently in use or sitting free in the buddy allocator's free list.
 
 Every physical page frame in the system has a corresponding `struct page` (`include/linux/mm_types.h:79`). On a system with 64 GB of RAM, there are 16 million `struct page` instances, arranged in a flat array (`mem_map`) or sparse sections. The structure is one of the most space-optimized in the kernel — it uses unions extensively because different page types (anonymous, file-backed, slab, compound) need different metadata.
 
@@ -182,6 +196,8 @@ graph TB
 ```
 
 ### 1.5 Page Table Structure on x86_64
+
+Page tables are the bridge between virtual and physical addresses. When your process accesses address `0x7ffd_1234_5678`, the CPU hardware walks a multi-level tree structure to translate that virtual address into a physical page frame number. This walk happens on *every* memory access (though the TLB — Translation Lookaside Buffer — caches recent results so it is usually fast).
 
 x86_64 uses a radix-tree page table with 4 levels (or 5 with LA57/Intel's 5-level paging). Each level indexes 9 bits of the virtual address, and each table is a 4KB page containing 512 entries of 8 bytes each. The levels are defined in `arch/x86/include/asm/pgtable_64_types.h`:
 
@@ -312,6 +328,8 @@ The `PF_RANDOMIZE` flag on the process (cleared by disabling ASLR via `personali
 
 ## 3. Virtual Memory Operations
 
+These are the kernel-side implementations of the syscalls you already know: `mmap()`, `munmap()`, `brk()`, `mprotect()`, `madvise()`, and `mlock()`. The key insight for all of them is that they mostly manipulate metadata (VMAs, page table entries, flags) — the actual allocation of physical memory is almost always deferred to the page fault handler (Section 4).
+
 ### 3.1 mmap — Creating a Virtual Memory Region
 
 When a process calls `mmap()`, the syscall dispatches to `do_mmap()` (`mm/mmap.c:334`), which is the central function for creating virtual memory mappings. It takes a file descriptor (or NULL for anonymous), an address hint, length, protection flags, map flags, and file offset.
@@ -377,6 +395,8 @@ The `mlock()` syscall (`mm/mlock.c:659`) sets `VM_LOCKED` on the specified range
 ---
 
 ## 4. Page Fault Handling
+
+Page faults are where the real work of memory management happens. When you call `mmap()`, no physical memory is allocated — the kernel just creates a VMA. When you call `malloc()` and the C library extends the heap with `brk()`, still no physical memory. It is only when your process actually *touches* a virtual address that the CPU raises a page fault, and the kernel allocates a physical page, fills it with the right data (zeros, file contents, swap data), and wires it into the page tables.
 
 A page fault is the mechanism by which the kernel implements demand paging, copy-on-write, swapping, and memory-mapped file I/O. When the CPU accesses a virtual address whose PTE is not present (or violates permissions), it raises a page fault exception. On x86_64, the handler is `exc_page_fault()` (`arch/x86/mm/fault.c:1483`).
 
@@ -501,6 +521,8 @@ graph TB
 ---
 
 ## 5. Physical Memory Allocation
+
+In user space, `malloc()` is your allocator. In the kernel, there are two layers: the **buddy allocator** hands out whole pages (4KB, 8KB, 16KB, ..., up to 4MB), and the **slab allocator** (SLUB) subdivides those pages into smaller fixed-size objects (like a 192-byte `struct dentry` or a 640-byte `struct inode`). When you call `kmalloc(128, GFP_KERNEL)` in kernel code, it goes through SLUB; when the kernel needs a full page for a page table or a user-space mapping, it goes through the buddy allocator.
 
 ### 5.1 The Buddy Allocator
 
@@ -628,6 +650,8 @@ The `kmalloc()` family allocates from generic power-of-two caches (8, 16, 32, 64
 
 ## 6. Memory Reclaim
 
+You might wonder: if the kernel allocates pages on every page fault and every `kmalloc()`, what happens when physical memory fills up? The answer is **reclaim** — the kernel finds pages that are not actively needed and evicts them. Clean file-backed pages (like cached file data) are simply discarded (they can be re-read from disk). Dirty file-backed pages are written back first. Anonymous pages (heap, stack) are written to swap. This is the mechanism behind the "Linux uses all my RAM" phenomenon — the kernel fills RAM with useful page cache data and reclaims it only when needed.
+
 When the system runs low on memory, the kernel must reclaim pages — evict data from RAM to make room for new allocations. Reclaim is governed by the LRU (Least Recently Used) lists and managed by both the asynchronous kswapd daemon and synchronous direct reclaim.
 
 ### 6.1 LRU Lists
@@ -731,6 +755,8 @@ graph TB
 
 ## 7. The OOM Killer
 
+If you have ever seen `dmesg` output that says "Out of memory: Killed process 1234 (myapp)" — this is the OOM killer. It is the kernel's last resort when both reclaim and compaction fail to free enough memory: pick a process, kill it, and take its memory. It is crude but necessary to keep the system alive.
+
 When reclaim fails to free enough memory and the system is critically low, the Out-Of-Memory killer intervenes. The entry point is `out_of_memory()` (`mm/oom_kill.c:1119`).
 
 ### 7.1 Scoring: `oom_badness()`
@@ -808,6 +834,8 @@ The `khugepaged` kernel thread (`mm/khugepaged.c`) performs the reverse operatio
 ---
 
 ## 10. Copy-on-Write in Detail
+
+This is one of the most elegant tricks in the kernel. When you call `fork()`, the child gets a "copy" of the parent's entire address space. But actually copying gigabytes of memory would be absurdly slow. Instead, the kernel shares the physical pages between parent and child, marks them read-only, and only copies a page when one side writes to it. Most pages (code, read-only data, shared libraries) are never written and therefore never copied. This is why `fork()` is fast.
 
 Copy-on-write (COW) is the mechanism that makes `fork()` efficient. Instead of duplicating the entire address space, the kernel shares physical pages between parent and child and marks them read-only. Only when one process writes does the actual copy occur.
 

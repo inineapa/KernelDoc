@@ -4,11 +4,21 @@
 
 ---
 
+## Before You Begin
+
+In user space, a "process" is something you fork, exec, and wait on. You interact with it through PIDs, signals, and file descriptors. But in the kernel, a process is a collection of data structures — a `task_struct` that points to an address space, a file table, signal handlers, and scheduling metadata. Understanding what these structures contain and how they connect is the first step toward reading kernel code confidently.
+
+This document traces a process from birth (`fork`) through life (scheduling and context switching) to death (`exit`), with source-level references to Linux 6.19. If you have been writing user-space C for a few years, you already know the syscall side of these operations. Here, we look at what happens on the other side of that syscall boundary.
+
+---
+
 ## 1. Core Data Structures and Their Relationships
 
-Every process in the Linux kernel is represented by a `task_struct`, defined at `include/linux/sched.h:819`. This single structure is the kernel's view of a process — it holds the process state, scheduling parameters, PID, kernel stack pointer, and pointers to every resource the process owns. Rather than embedding all data directly, `task_struct` points outward to separate structures that each manage a specific domain of the process's resources.
+Every process in the Linux kernel is represented by a `task_struct`, defined at `include/linux/sched.h:819`. If you have ever used `getpid()`, `fork()`, or `kill()` from user space, you were operating on fields inside this structure without knowing it. The `task_struct` is the kernel's view of a process — it holds the process state, scheduling parameters, PID, kernel stack pointer, and pointers to every resource the process owns. Rather than embedding all data directly, `task_struct` points outward to separate structures that each manage a specific domain of the process's resources.
 
 ### 1.1 thread_info — The Low-Level Foundation
+
+You can think of `thread_info` as the "fast-path metadata" that the kernel checks on every return from a syscall or interrupt. It lives inside `task_struct` but exists as a separate struct because its fields are accessed from hand-tuned assembly code on the kernel's hottest paths.
 
 The very first field of `task_struct` is `struct thread_info`, embedded directly at offset zero (`include/linux/sched.h:822`, when `CONFIG_THREAD_INFO_IN_TASK` is set, which x86_64 always uses). This placement is deliberate: because `thread_info` sits at the start of `task_struct`, casting between the two is a zero-cost pointer identity — `(struct thread_info *)current` and `(struct task_struct *)ti` point to the same address.
 
@@ -58,6 +68,8 @@ The `status` field holds thread-synchronous flags that only the owning thread re
 The `cpu` field (present only with `CONFIG_SMP`) records which CPU this task is currently running on.
 
 #### Why x86_64's thread_info Does Not Contain preempt_count
+
+This subsection is a deep dive into a hardware-level design difference. If you are reading this document for the first time, you can safely skip it and come back later — the key takeaway is that `preempt_count` exists, it tracks whether the kernel can be preempted, and x86_64 accesses it via the `%gs` register while arm64 puts it in `thread_info`. The details below explain *why*.
 
 On arm64, `thread_info` embeds the preempt counter directly as a `u64 preempt_count` field (`arch/arm64/include/asm/thread_info.h:30`). This 64-bit field uses a union with a struct to overlay a 32-bit `count` and a 32-bit `need_resched` side by side. When arm64's `__preempt_count_dec_and_test()` decrements the count, it reads the full 64-bit value: if the entire 64 bits are zero, both the preemption nesting depth and the need-resched flag are clear simultaneously, meaning preemption should proceed. This is elegant but requires non-atomic read-modify-write sequences (separate `READ_ONCE` / `WRITE_ONCE`) because arm64 lacks a single instruction that can both decrement and test a memory location in one atomic step.
 
@@ -271,6 +283,8 @@ stateDiagram-v2
 
 ## 2. Process Creation
 
+In user space, you call `fork()` and get a child PID back. That single syscall triggers a long chain of kernel operations: allocating a new `task_struct`, copying (or sharing) file descriptors, address space, signal handlers, and more. This section traces that chain.
+
 ### 2.1 User-Space Process Creation (fork / clone)
 
 When a user-space process calls `fork()`, `clone()`, or `clone3()`, the syscall entry layer routes the request to `kernel_clone()` (`fork.c:2610`). This function first validates the clone flags, then calls `copy_process()` (`fork.c:1966`) to perform the deep copy of the parent's `task_struct`.
@@ -434,6 +448,8 @@ sequenceDiagram
 ---
 
 ## 3. Context Switch
+
+A context switch is what makes multitasking possible. In user space, you see it as "my process ran, then another process ran, then mine ran again." In the kernel, it is a precise sequence of saving one task's CPU state and loading another's. This is the most performance-critical path in the scheduler.
 
 ### 3.1 Overall Flow
 
@@ -769,6 +785,8 @@ The following table enumerates all CPU state that must be saved and restored dur
 
 ## 4. Process Destruction
 
+In user space, calling `exit()` or receiving a `SIGKILL` ends your process. But from the kernel's perspective, process death is a surprisingly careful sequence: every resource must be released in the right order, the parent must be notified, and — most interestingly — the dying process cannot free its own kernel stack (because it is still using it). This section explains how the kernel solves each of these problems.
+
 ### 4.1 Two Paths to Death: exit() and Fatal Signals
 
 A process can terminate in two fundamentally different ways: by voluntarily calling `exit()` (or `exit_group()`), or by receiving a fatal signal (such as `SIGKILL`, `SIGSEGV`, or `SIGTERM` with default disposition). Although the triggers differ, both paths converge on the same function: `do_exit()`.
@@ -1048,6 +1066,8 @@ graph TB
 ---
 
 ## 5. Preemption and Interrupts in the Context of Processes
+
+If you have wondered how the kernel takes the CPU away from a process that is in an infinite loop (without the process cooperating), this section is the answer. "Preemption" is the kernel's ability to interrupt a running task and give the CPU to someone else. The mechanism builds on two things you have already seen: the `TIF_NEED_RESCHED` flag in `thread_info` (Section 1.1) and the `preempt_count` variable (Section 1.1, preempt_count subsection). For a deeper look at the hardware interrupt delivery mechanism itself, see `interrupt.md`.
 
 Understanding how processes are interrupted and preempted is essential to understanding why certain data structures (like `thread_info.flags` and `preempt_count`) exist and how they interact with the scheduler.
 
